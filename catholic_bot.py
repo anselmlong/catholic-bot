@@ -159,7 +159,6 @@ async def deliver_daily(app, chat_id: int, prefs: dict):
 
 async def daily_push(context: ContextTypes.DEFAULT_TYPE):
     subs = load_subs()
-    now = context.application.loop.time  # approximate
     from datetime import datetime
     current_time = datetime.now(SGT).strftime("%H:%M")
     for chat_id_str, prefs in subs.items():
