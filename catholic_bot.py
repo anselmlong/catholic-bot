@@ -18,6 +18,7 @@ from telegram.ext import (
 SGT = ZoneInfo("Asia/Singapore")
 TOKEN = "REVOKED_TOKEN"
 SUBS_FILE = "/home/ubuntu/catholic-bot/subscriptions.json"
+PYTHON = "/home/ubuntu/confessit-scraper/venv/bin/python3"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -63,7 +64,7 @@ def fetch_readings(d: date | None = None) -> dict | None:
         tmp_path = tmp.name
     try:
         proc = subprocess.run(
-            ["python3", "-m", "catholic_mass_readings", "get-mass",
+            [PYTHON, "-m", "catholic_mass_readings", "get-mass",
              "--date", d.isoformat(), "--type", "DEFAULT", "--save", tmp_path],
             capture_output=True, text=True, timeout=30,
         )
