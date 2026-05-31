@@ -15,8 +15,8 @@ dist/
 # logs
 *.log
 
-# bot token — hardcoded for now but should be env var'd
-# .env
+# bot token — loaded from .env
+.env
 
 # editor
 .vscode/

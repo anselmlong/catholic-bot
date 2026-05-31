@@ -6,18 +6,24 @@ import logging
 import os
 import random
 import subprocess
+import sys
 import tempfile
 from datetime import date
 from zoneinfo import ZoneInfo
 
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes,
 )
 
 SGT = ZoneInfo("Asia/Singapore")
-TOKEN = "REVOKED_TOKEN"
-SUBS_FILE = "/home/ubuntu/catholic-bot/subscriptions.json"
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    print("ERROR: BOT_TOKEN not set in .env", file=sys.stderr)
+    sys.exit(1)
+SUBS_FILE = os.path.join(os.path.dirname(__file__), "subscriptions.json")
 PYTHON = "/home/ubuntu/confessit-scraper/venv/bin/python3"
 
 logging.basicConfig(
