@@ -4,12 +4,12 @@
 import json
 import logging
 import os
+import random
 import subprocess
 import tempfile
 from datetime import date
 from zoneinfo import ZoneInfo
 
-import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes,
@@ -119,27 +119,59 @@ def format_readings(data: dict, mode: str = "full") -> str:
     return "\n".join(parts)
 
 
-# ── truth ───────────────────────────────────────────────────────────────────
-async def fetch_truth() -> str | None:
-    tries = [
-        ("https://labs.bible.org/api/", {"passage": "random", "type": "json"}),
-        ("https://bible-api.com/", {"random": "verse"}),
-    ]
-    for url, params in tries:
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(url, params=params)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                if isinstance(data, list) and data:
-                    v = data[0]
-                    return f'*{v["bookname"]} {v["chapter"]}:{v["verse"]}*\n\n{v["text"]}'
-                if isinstance(data, dict) and "reference" in data:
-                    return f'*{data["reference"]}*\n\n{data["text"]}'
-        except Exception:
-            continue
-    return None
+# ── truth (curated verses) ─────────────────────────────────────────────────
+TRUTHS = {
+    "peace": [
+        ('"Do not be anxious about anything, but in every situation, by prayer and petition, with thanksgiving, present your requests to God. And the peace of God, which transcends all understanding, will guard your hearts and your minds in Christ Jesus."', "Philippians 4:6-7"),
+        ('"So do not fear, for I am with you; do not be dismayed, for I am your God. I will strengthen you and help you; I will uphold you with my righteous right hand."', "Isaiah 41:10"),
+        ('"Peace I leave with you; my peace I give you. I do not give to you as the world gives. Do not let your hearts be troubled and do not be afraid."', "John 14:27"),
+        ('"I sought the Lord, and he answered me; he delivered me from all my fears."', "Psalm 34:4"),
+        ('"Therefore do not worry about tomorrow, for tomorrow will worry about itself. Each day has enough trouble of its own."', "Matthew 6:34"),
+    ],
+    "strength": [
+        ('"Be strong and courageous. Do not be afraid; do not be discouraged, for the Lord your God will be with you wherever you go."', "Joshua 1:9"),
+        ('"But those who hope in the Lord will renew their strength. They will soar on wings like eagles; they will run and not grow weary, they will walk and not be faint."', "Isaiah 40:31"),
+        ('"Be strong and courageous. Do not be afraid or terrified because of them, for the Lord your God goes with you; he will never leave you nor forsake you."', "Deuteronomy 31:6"),
+        ('"The Lord is my light and my salvation — whom shall I fear? The Lord is the stronghold of my life — of whom shall I be afraid?"', "Psalm 27:1"),
+        ('"For God has not given us a spirit of fear, but of power and of love and of a sound mind."', "2 Timothy 1:7"),
+    ],
+    "hope": [
+        ('"For I know the plans I have for you," declares the Lord, "plans to prosper you and not to harm you, plans to give you hope and a future."', "Jeremiah 29:11"),
+        ('"May the God of hope fill you with all joy and peace as you trust in him, so that you may overflow with hope by the power of the Holy Spirit."', "Romans 15:13"),
+        ('"Yes, my soul, find rest in God; my hope comes from him."', "Psalm 62:5"),
+        ('"Because of the Lord\'s great love we are not consumed, for his compassions never fail. They are new every morning; great is your faithfulness."', "Lamentations 3:22-23"),
+        ('"And we know that in all things God works for the good of those who love him, who have been called according to his purpose."', "Romans 8:28"),
+    ],
+    "love": [
+        ('"Love is patient, love is kind. It does not envy, it does not boast, it is not proud. It does not dishonor others, it is not self-seeking, it is not easily angered, it keeps no record of wrongs."', "1 Corinthians 13:4-5"),
+        ('"We love because he first loved us."', "1 John 4:19"),
+        ('"For God so loved the world that he gave his one and only Son, that whoever believes in him shall not perish but have eternal life."', "John 3:16"),
+        ('"For I am convinced that neither death nor life, neither angels nor demons, neither the present nor the future, nor any powers, nor anything else in all creation, will be able to separate us from the love of God that is in Christ Jesus our Lord."', "Romans 8:38-39"),
+        ('"There is no fear in love. But perfect love drives out fear."', "1 John 4:18"),
+    ],
+    "comfort": [
+        ('"The Lord is near to the brokenhearted and saves those who are crushed in spirit."', "Psalm 34:18"),
+        ('"Praise be to the God and Father of our Lord Jesus Christ, the Father of compassion and the God of all comfort, who comforts us in all our troubles."', "2 Corinthians 1:3-4"),
+        ('"Come to me, all you who are weary and burdened, and I will give you rest."', "Matthew 11:28"),
+        ('"He heals the brokenhearted and binds up their wounds."', "Psalm 147:3"),
+        ('"He will wipe every tear from their eyes. There will be no more death or mourning or crying or pain."', "Revelation 21:4"),
+    ],
+    "faith": [
+        ('"Trust in the Lord with all your heart and lean not on your own understanding; in all your ways submit to him, and he will make your paths straight."', "Proverbs 3:5-6"),
+        ('"Now faith is confidence in what we hope for and assurance about what we do not see."', "Hebrews 11:1"),
+        ('"For we live by faith, not by sight."', "2 Corinthians 5:7"),
+        ('"Be still, and know that I am God."', "Psalm 46:10"),
+        ('"If you have faith as small as a mustard seed, you can say to this mountain, \'Move from here to there,\' and it will move. Nothing will be impossible for you."', "Matthew 17:20"),
+    ],
+}
+
+ALL_TRUTHS = [item for items in TRUTHS.values() for item in items]
+
+
+def pick_truth() -> str:
+    """Return a random curated verse formatted for Telegram."""
+    text, ref = random.choice(ALL_TRUTHS)
+    return f"*{ref}*\n\n{text}"
 
 
 # ── daily push ──────────────────────────────────────────────────────────────
@@ -152,9 +184,8 @@ async def deliver_daily(app, chat_id: int, prefs: dict):
         await app.bot.send_message(chat_id=chat_id, text="Couldn't fetch today's readings. 🙏")
 
     if prefs.get("truth", True):
-        verse = await fetch_truth()
-        if verse:
-            await app.bot.send_message(chat_id=chat_id, text=f"*Truth for the day:*\n\n{verse}", parse_mode="Markdown")
+        verse = pick_truth()
+        await app.bot.send_message(chat_id=chat_id, text=f"*Truth for the day:*\n\n{verse}", parse_mode="Markdown")
 
 
 async def daily_push(context: ContextTypes.DEFAULT_TYPE):
@@ -261,9 +292,8 @@ async def help_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         "`/unsubscribe` — Stop daily readings\n"
         "`/mysub` — See your current preferences\n"
         "`/help` — This message\n\n"
-        "*Data sources:*\n"
-        "📜 Readings: USCCB (United States Conference of Catholic Bishops)\n"
-        "📖 Verses: NET Bible via labs.bible.org\n\n"
+        "*Data source:*\n"
+        "📖 Verses curated from NIV/NLT — the most shared scriptures\n\n"
         "Daily push runs at your chosen time (Singapore time).",
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
@@ -335,12 +365,8 @@ async def today(update: Update, _context: ContextTypes.DEFAULT_TYPE):
 
 
 async def truth(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🙏 one sec...")
-    verse = await fetch_truth()
-    if not verse:
-        await msg.edit_text("Couldn't fetch a verse. Try again later 🙏")
-        return
-    await msg.edit_text(verse, parse_mode="Markdown")
+    verse = pick_truth()
+    await update.message.reply_text(verse, parse_mode="Markdown")
 
 
 # ── keyboard button router ──────────────────────────────────────────────────
