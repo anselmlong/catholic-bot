@@ -1,0 +1,24 @@
+# venv
+venv/
+env/
+
+# cache and subscriptions
+readings_cache.json
+subscriptions.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+
+# logs
+*.log
+
+# bot token — hardcoded for now but should be env var'd
+# .env
+
+# editor
+.vscode/
+.idea/
+*.swp
