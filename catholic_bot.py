@@ -66,8 +66,9 @@ def default_prefs():
 # ── readings ────────────────────────────────────────────────────────────────
 def fetch_readings(d: date | None = None) -> dict | None:
     if d is None:
-        d = date.today()
-    for attempt in range(2):
+        from datetime import datetime
+        d = datetime.now(SGT).date()
+    for attempt in range(3):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
             tmp_path = tmp.name
         try:
@@ -78,8 +79,8 @@ def fetch_readings(d: date | None = None) -> dict | None:
             )
             if proc.returncode != 0:
                 log.warning(f"CLI failed for {d} (attempt {attempt + 1}): {proc.stderr[:200]}")
-                if attempt == 0:
-                    time.sleep(3)
+                if attempt < 2:
+                    time.sleep(3 + attempt * 3)
                     continue
                 return None
             with open(tmp_path) as f:
@@ -106,8 +107,8 @@ def fetch_readings(d: date | None = None) -> dict | None:
             return {"title": raw.get("title", "Daily Mass Readings"), "date": d.isoformat(), "readings": curated}
         except Exception as e:
             log.error(f"fetch_readings error (attempt {attempt + 1}): {e}")
-            if attempt == 0:
-                time.sleep(3)
+            if attempt < 2:
+                time.sleep(3 + attempt * 3)
                 continue
             return None
         finally:
