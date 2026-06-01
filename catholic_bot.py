@@ -8,6 +8,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import date
 from zoneinfo import ZoneInfo
 
@@ -66,44 +67,52 @@ def default_prefs():
 def fetch_readings(d: date | None = None) -> dict | None:
     if d is None:
         d = date.today()
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        proc = subprocess.run(
-            [PYTHON, "-m", "catholic_mass_readings", "get-mass",
-             "--date", d.isoformat(), "--type", "DEFAULT", "--save", tmp_path],
-            capture_output=True, text=True, timeout=30,
-        )
-        if proc.returncode != 0:
-            log.warning(f"CLI failed for {d}: {proc.stderr[:200]}")
-            return None
-        with open(tmp_path) as f:
-            raw = json.load(f)
-        sections = raw.get("sections", [])
-        curated = []
-        for sec in sections:
-            if sec.get("type") == "ALLELUIA":
+    for attempt in range(2):
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            proc = subprocess.run(
+                [PYTHON, "-m", "catholic_mass_readings", "get-mass",
+                 "--date", d.isoformat(), "--type", "DEFAULT", "--save", tmp_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                log.warning(f"CLI failed for {d} (attempt {attempt + 1}): {proc.stderr[:200]}")
+                if attempt == 0:
+                    time.sleep(3)
+                    continue
+                return None
+            with open(tmp_path) as f:
+                raw = json.load(f)
+            sections = raw.get("sections", [])
+            curated = []
+            for sec in sections:
+                if sec.get("type") == "ALLELUIA":
+                    continue
+                for r in sec.get("readings", []):
+                    verses = r.get("verses", [])
+                    citation = verses[0]["text"] if verses else ""
+                    text = r.get("text", "").strip()
+                    for phrase in [
+                        "The word of the Lord.", "Thanks be to God.",
+                        "The Gospel of the Lord.", "Praise to you, Lord Jesus Christ.",
+                    ]:
+                        text = text.replace(phrase, "")
+                    curated.append({
+                        "header": sec.get("header", ""),
+                        "citation": citation,
+                        "text": text.strip(),
+                    })
+            return {"title": raw.get("title", "Daily Mass Readings"), "date": d.isoformat(), "readings": curated}
+        except Exception as e:
+            log.error(f"fetch_readings error (attempt {attempt + 1}): {e}")
+            if attempt == 0:
+                time.sleep(3)
                 continue
-            for r in sec.get("readings", []):
-                verses = r.get("verses", [])
-                citation = verses[0]["text"] if verses else ""
-                text = r.get("text", "").strip()
-                for phrase in [
-                    "The word of the Lord.", "Thanks be to God.",
-                    "The Gospel of the Lord.", "Praise to you, Lord Jesus Christ.",
-                ]:
-                    text = text.replace(phrase, "")
-                curated.append({
-                    "header": sec.get("header", ""),
-                    "citation": citation,
-                    "text": text.strip(),
-                })
-        return {"title": raw.get("title", "Daily Mass Readings"), "date": d.isoformat(), "readings": curated}
-    except Exception as e:
-        log.error(f"fetch_readings error: {e}")
-        return None
-    finally:
-        subprocess.run(["rm", "-f", tmp_path])
+            return None
+        finally:
+            subprocess.run(["rm", "-f", tmp_path])
+    return None
 
 
 def format_readings(data: dict, mode: str = "full") -> str:
