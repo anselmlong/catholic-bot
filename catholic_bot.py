@@ -291,7 +291,8 @@ async def help_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Commands*\n\n"
         "`/today` — Today's mass readings (Reading 1, Psalm, Reading 2, Gospel)\n"
-        "`/truth` — Random Bible verse from anywhere in scripture\n"
+        "`/readings 2026-06-01` — Readings for any past date\n"
+        "`/truth` — Random Bible verse from a curated list\n"
         "`/subscribe` — Set up daily push at 6/7/8am SGT\n"
         "   • Pick full readings or gospel-only\n"
         "   • Toggle daily truth on/off\n"
@@ -370,6 +371,25 @@ async def today(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(format_readings(data), parse_mode="Markdown")
 
 
+async def readings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fetch readings for a specific date: /readings 2026-05-25"""
+    if not context.args:
+        await update.message.reply_text("Usage: `/readings 2026-05-25`", parse_mode="Markdown")
+        return
+    try:
+        d = date.fromisoformat(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid date. Use YYYY-MM-DD format.")
+        return
+
+    msg = await update.message.reply_text(f"📖 fetching for {d.isoformat()}...")
+    data = fetch_readings(d)
+    if not data:
+        await msg.edit_text(f"No readings found for {d.isoformat()}. USCCB might not have it published.")
+        return
+    await msg.edit_text(format_readings(data), parse_mode="Markdown")
+
+
 async def truth(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     verse = pick_truth()
     await update.message.reply_text(verse, parse_mode="Markdown")
@@ -395,6 +415,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("today", today))
+    app.add_handler(CommandHandler("readings", readings))
     app.add_handler(CommandHandler("truth", truth))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
