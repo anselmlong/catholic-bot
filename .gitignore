@@ -22,3 +22,6 @@ dist/
 .vscode/
 .idea/
 *.swp
+# runtime data
+users.json
+obolus_cookie.json
