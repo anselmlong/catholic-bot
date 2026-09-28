@@ -10,14 +10,15 @@ import sys
 import time
 import threading
 import asyncio
-from datetime import date
+from datetime import date, datetime, timedelta
+from html import escape
 from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, LinkPreviewOptions, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, JobQueue,
 )
@@ -30,6 +31,10 @@ if not TOKEN:
     sys.exit(1)
 SUBS_FILE = os.path.join(os.path.dirname(__file__), "subscriptions.json")
 USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
+# nearest Mass comes from MassGoWhere, so both bots and the website give the same answer
+MASS_API = os.getenv("MASSGOWHERE_API", "https://mass.anselmlong.com").rstrip("/")
+MASS_BOT = "massgowherebot"
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,9 +46,11 @@ _subs_lock = threading.Lock()
 _mem_cache: dict = {}  # in-memory readings cache keyed by date ISO string
 
 # ── persistent keyboard ─────────────────────────────────────────────────────
+NEAREST_MASS = "⛪ Nearest Mass"
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["📖 Today", "🙏 Truth"],
+        [KeyboardButton(NEAREST_MASS, request_location=True)],
         ["⚙️ Subscribe", "ℹ️ Help"],
     ],
     resize_keyboard=True,
@@ -1006,6 +1013,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 `/today` — today's mass readings\n"
         "🙏 `/truth` — random Bible verse\n"
         "⚙️ `/subscribe` — daily push at your preferred time\n"
+        "⛪ *Nearest Mass* — the next Mass you can get to\n"
         "ℹ️ `/help` — all commands\n\n"
         "Use the buttons below to get started!",
         parse_mode="Markdown",
@@ -1022,6 +1030,7 @@ async def help_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         "   • Pick full readings or gospel-only\n"
         "   • Toggle daily truth on/off\n"
         "`/unsubscribe` — Stop daily messages\n"
+        "`/mass` — Nearest Mass you can get to by bus & MRT\n"
         "`/help` — This message\n\n"
         "*Data source:*\n"
         "📖 Mass readings: Jerusalem Bible via Universalis API (Singapore calendar)\n"
@@ -1108,6 +1117,100 @@ async def users_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# ── nearest Mass (via MassGoWhere) ──────────────────────────────────────────
+def _mass_clock(iso: str) -> str:
+    t = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(SGT)
+    return t.strftime("%I:%M%p").lstrip("0").lower()
+
+
+def _mass_day(iso: str) -> str:
+    d = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(SGT).date()
+    today_sg = datetime.now(SGT).date()
+    if d == today_sg:
+        return "today"
+    if d == today_sg + timedelta(days=1):
+        return "tomorrow"
+    return d.strftime("%A")
+
+
+def _fetch_next_mass(lat: float, lng: float):
+    """MassGoWhere's answer for bus & MRT, leaving now. None if outside Singapore."""
+    q = {"lat": f"{lat:.5f}", "lng": f"{lng:.5f}", "mode": "transit"}
+    try:
+        r = requests.get(f"{MASS_API}/api/next", params=q, timeout=15)
+    except requests.RequestException:
+        # live routing can be slow; the estimate-only answer comes back in a moment
+        r = requests.get(f"{MASS_API}/api/next", params={**q, "fast": "1"}, timeout=10)
+    if r.status_code == 400:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def _more_options_line() -> str:
+    return (f"For car or walking, other times, or planning ahead, use @{MASS_BOT} "
+            f"or <a href=\"{MASS_API}\">{escape(MASS_API.split('//')[-1])}</a>.")
+
+
+async def mass_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """/mass: location can only come from the keyboard button, so point people to it."""
+    if is_group(update):
+        await update.message.reply_text(
+            f"To find the nearest Mass, message me directly and tap <b>{NEAREST_MASS}</b>, or use @{MASS_BOT}.",
+            parse_mode="HTML",
+        )
+        return
+    await update.message.reply_text(
+        f"Tap <b>{NEAREST_MASS}</b> below to share your location, and I'll find the next Mass you can get to by bus &amp; MRT.\n\n"
+        f"On a computer? Location sharing only works in the Telegram phone app, so try @{MASS_BOT} and send a postal code.",
+        parse_mode="HTML",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def nearest_mass(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    loc = update.message.location
+    note = await update.message.reply_text("⛪ Finding the nearest Mass…")
+    try:
+        res = await asyncio.to_thread(_fetch_next_mass, loc.latitude, loc.longitude)
+    except Exception as e:  # noqa: BLE001 - never leave the user hanging
+        log.warning("massgowhere api error: %s", e)
+        await note.edit_text(
+            f"Sorry, I couldn't check Mass times just now. Please try again in a minute, or use @{MASS_BOT}.")
+        return
+    if res is None:
+        await note.edit_text("That location isn't in Singapore. Nearest Mass only covers Singapore's parishes.")
+        return
+    b = res.get("best")
+    if not b:
+        await note.edit_text(
+            "I couldn't find a Mass you can reach by bus &amp; MRT in the next two days.\n\n" + _more_options_line(),
+            parse_mode="HTML", link_preview_options=NO_PREVIEW)
+        return
+    p = b["parish"]
+    about = "about " if b.get("travelSource") == "estimate" else ""
+    how = "on foot" if b.get("walk") else "by bus &amp; MRT"
+    extra = " · ".join(x for x in [f"{b['language']} Mass" if b.get("language") not in (None, "", "English") else "",
+                                   b.get("note") or ""] if x)
+    lines = [
+        f"⛪ <b>{_mass_clock(b['start'])} {_mass_day(b['start'])}</b>",
+        f"<b>{escape(p['name'])}</b>" + (f"\n{escape(extra)}" if extra else ""),
+        "",
+        f"Leave by <b>{_mass_clock(b['leaveBy'])}</b> · {about}{b['travelMin']} min {how}",
+    ]
+    if res.get("specialDay"):
+        lines += ["", f"<i>{escape(res['specialDay'])}: Mass times often change today. Please check with the parish.</i>"]
+    lines += ["", _more_options_line()]
+    dest = requests.utils.quote(f"{p['name']}, Singapore {p.get('postal') or ''}".strip())
+    travel = "walking" if b.get("walk") else "transit"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧭 Navigate", url=f"https://www.google.com/maps/dir/?api=1&destination={dest}&travelmode={travel}"
+                                                 f"&origin={loc.latitude},{loc.longitude}")],
+        [InlineKeyboardButton("More options in MassGoWhere", url=f"https://t.me/{MASS_BOT}")],
+    ])
+    await note.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb, link_preview_options=NO_PREVIEW)
+
+
 # ── keyboard button router ──────────────────────────────────────────────────
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -1130,6 +1233,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📖 `/today` — today's mass readings\n"
             "🙏 `/truth` — random Bible verse\n"
             "⚙️ `/subscribe` — daily push at your preferred time\n"
+            "⛪ *Nearest Mass* — the next Mass you can get to\n"
             "ℹ️ `/help` — all commands\n\n"
             "Use the buttons below to get started!",
             parse_mode="Markdown",
@@ -1145,6 +1249,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await subscribe(update, context)
     elif text == "ℹ️ Help":
         await help_cmd(update, context)
+    elif text == NEAREST_MASS:  # arrives as text only where the app can't share location (e.g. Telegram Desktop)
+        await mass_cmd(update, context)
 
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -1158,6 +1264,8 @@ def main():
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
     app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("mass", mass_cmd))
+    app.add_handler(MessageHandler(filters.LOCATION, nearest_mass))
     app.add_handler(CallbackQueryHandler(sub_callback, pattern="^sub_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
 
