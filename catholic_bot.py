@@ -1133,14 +1133,13 @@ def _mass_day(iso: str) -> str:
     return d.strftime("%A")
 
 
-def _fetch_next_mass(lat: float, lng: float):
-    """MassGoWhere's answer for bus & MRT, leaving now. None if outside Singapore."""
+def _fetch_next_mass(lat: float, lng: float, fast: bool = False):
+    """MassGoWhere's answer for bus & MRT, leaving now. None if outside Singapore.
+    fast=True is the estimate-only answer (about a second); the default adds live OneMap routes (a few seconds)."""
     q = {"lat": f"{lat:.5f}", "lng": f"{lng:.5f}", "mode": "transit"}
-    try:
-        r = requests.get(f"{MASS_API}/api/next", params=q, timeout=15)
-    except requests.RequestException:
-        # live routing can be slow; the estimate-only answer comes back in a moment
-        r = requests.get(f"{MASS_API}/api/next", params={**q, "fast": "1"}, timeout=10)
+    if fast:
+        q["fast"] = "1"
+    r = requests.get(f"{MASS_API}/api/next", params=q, timeout=8 if fast else 15)
     if r.status_code == 400:
         return None
     r.raise_for_status()
@@ -1168,25 +1167,11 @@ async def mass_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def nearest_mass(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    loc = update.message.location
-    note = await update.message.reply_text("⛪ Finding the nearest Mass…")
-    try:
-        res = await asyncio.to_thread(_fetch_next_mass, loc.latitude, loc.longitude)
-    except Exception as e:  # noqa: BLE001 - never leave the user hanging
-        log.warning("massgowhere api error: %s", e)
-        await note.edit_text(
-            f"Sorry, I couldn't check Mass times just now. Please try again in a minute, or use @{MASS_BOT}.")
-        return
-    if res is None:
-        await note.edit_text("That location isn't in Singapore. Nearest Mass only covers Singapore's parishes.")
-        return
+def _render_mass(res: dict, loc, refining: bool):
+    """(text, keyboard) for a MassGoWhere answer; refining marks the quick estimate while live routes load."""
     b = res.get("best")
     if not b:
-        await note.edit_text(
-            "I couldn't find a Mass you can reach by bus &amp; MRT in the next two days.\n\n" + _more_options_line(),
-            parse_mode="HTML", link_preview_options=NO_PREVIEW)
-        return
+        return ("I couldn't find a Mass you can reach by bus &amp; MRT in the next two days.\n\n" + _more_options_line(), None)
     p = b["parish"]
     about = "about " if b.get("travelSource") == "estimate" else ""
     how = "on foot" if b.get("walk") else "by bus &amp; MRT"
@@ -1198,6 +1183,8 @@ async def nearest_mass(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         "",
         f"Leave by <b>{_mass_clock(b['leaveBy'])}</b> · {about}{b['travelMin']} min {how}",
     ]
+    if refining:
+        lines += ["", "<i>Checking live bus &amp; MRT times…</i>"]
     if res.get("specialDay"):
         lines += ["", f"<i>{escape(res['specialDay'])}: Mass times often change today. Please check with the parish.</i>"]
     lines += ["", _more_options_line()]
@@ -1208,7 +1195,42 @@ async def nearest_mass(update: Update, _context: ContextTypes.DEFAULT_TYPE):
                                                  f"&origin={loc.latitude},{loc.longitude}")],
         [InlineKeyboardButton("More options in MassGoWhere", url=f"https://t.me/{MASS_BOT}")],
     ])
-    await note.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb, link_preview_options=NO_PREVIEW)
+    return "\n".join(lines), kb
+
+
+async def nearest_mass(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Answers straight away: a placeholder, then the quick estimate, then live travel times, each edited in place."""
+    loc = update.message.location
+    note = await update.message.reply_text("⛪ Finding the nearest Mass…")
+
+    async def show(text, kb=None, html=True):
+        try:
+            await note.edit_text(text, parse_mode="HTML" if html else None, reply_markup=kb,
+                                 link_preview_options=NO_PREVIEW if html else None)
+        except Exception as e:  # noqa: BLE001 - e.g. the live answer matches the estimate exactly ("not modified")
+            log.info("mass edit skipped: %s", e)
+
+    estimate = None
+    try:
+        estimate = await asyncio.to_thread(_fetch_next_mass, loc.latitude, loc.longitude, True)
+        if estimate is None:
+            await show("That location isn't in Singapore. Nearest Mass only covers Singapore's parishes.", html=False)
+            return
+        await show(*_render_mass(estimate, loc, refining=bool(estimate.get("best"))))
+    except Exception as e:  # noqa: BLE001
+        log.warning("massgowhere fast api error: %s", e)
+    try:
+        live = await asyncio.to_thread(_fetch_next_mass, loc.latitude, loc.longitude)
+        if live is None:
+            await show("That location isn't in Singapore. Nearest Mass only covers Singapore's parishes.", html=False)
+            return
+        await show(*_render_mass(live, loc, refining=False))
+    except Exception as e:  # noqa: BLE001 - never leave the user hanging
+        log.warning("massgowhere api error: %s", e)
+        if estimate:  # keep the estimate, drop the "checking live times" line
+            await show(*_render_mass(estimate, loc, refining=False))
+        else:
+            await show(f"Sorry, I couldn't check Mass times just now. Please try again in a minute, or use @{MASS_BOT}.", html=False)
 
 
 # ── keyboard button router ──────────────────────────────────────────────────
