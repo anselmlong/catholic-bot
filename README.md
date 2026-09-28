@@ -6,6 +6,7 @@ A Telegram bot for daily Catholic mass readings and random Bible verses. Serves 
 
 - **📖 Today's Readings** — Full mass readings (First Reading, Psalm, Second Reading, Gospel) or gospel-only
 - **🙏 Random Truth** — A random Bible verse from anywhere in scripture
+- **⛪ Nearest Mass** — Share your location to get the next Mass you can reach by bus & MRT, with directions (from [MassGoWhere](https://mass.anselmlong.com); @massgowherebot has more options)
 - **⚙️ Subscriptions** — Configurable daily push at 6am, 7am, or 8am SGT
 - **✂️ Customizable** — Choose between full readings or gospel-only, toggle daily truth on/off
 - **Name onboarding** — Greets you by name on `/start`
@@ -18,14 +19,16 @@ A Telegram bot for daily Catholic mass readings and random Bible verses. Serves 
 | `/today` | Today's mass readings |
 | `/truth` | Random Bible verse |
 | `/subscribe` | Set up daily push with inline preferences |
+| `/mass` | Nearest Mass you can get to (tap **⛪ Nearest Mass** to share location) |
 | `/help` | All commands |
 | `/users` | (admin only) List registered users |
 
-Or use the persistent keyboard: **📖 Today**, **🙏 Truth**, **⚙️ Subscribe**, **ℹ️ Help**
+Or use the persistent keyboard: **📖 Today**, **🙏 Truth**, **⛪ Nearest Mass**, **⚙️ Subscribe**, **ℹ️ Help**
 
 ## Data Sources
 
 - **Mass readings**: scraped from [Universalis](https://universalis.com) (Jerusalem Bible) with automatic fallback to [USCCB](https://bible.usccb.org/bible/readings/) (NAB)
+- **Nearest Mass**: [MassGoWhere](https://mass.anselmlong.com) `/api/next` (set `MASSGOWHERE_API` in `.env` if the site moves)
 - **Random verses**: NET Bible API ([labs.bible.org](https://labs.bible.org/)) by the Society of Biblical Literature
 
 ## Tech
