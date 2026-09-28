@@ -25,3 +25,4 @@ dist/
 # runtime data
 users.json
 obolus_cookie.json
+.gstack/

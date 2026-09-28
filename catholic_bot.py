@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """catholic-bot — daily mass readings + random bible verse + subscribe."""
 
+import html as html_lib
 import json
 import logging
 import os
@@ -8,7 +9,6 @@ import random
 import re
 import sys
 import time
-import threading
 import asyncio
 from datetime import date, datetime, timedelta
 from html import escape
@@ -35,15 +35,15 @@ USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
 MASS_API = os.getenv("MASSGOWHERE_API", "https://mass.anselmlong.com").rstrip("/")
 MASS_BOT = "massgowherebot"
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
-
+DIVINE_OFFICE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "divine_office_cache.json")
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger(__name__)
-
-_subs_lock = threading.Lock()
-_mem_cache: dict = {}  # in-memory readings cache keyed by date ISO string
+# silence per-poll noise (httpx also logs the bot token in request URLs)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
 
 # ── persistent keyboard ─────────────────────────────────────────────────────
 NEAREST_MASS = "⛪ Nearest Mass"
@@ -51,6 +51,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["📖 Today", "🙏 Truth"],
         [KeyboardButton(NEAREST_MASS, request_location=True)],
+        ["📖 Readings", "📜 Divine Office"],
         ["⚙️ Subscribe", "ℹ️ Help"],
     ],
     resize_keyboard=True,
@@ -59,20 +60,18 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 # ── subscriptions ───────────────────────────────────────────────────────────
 def load_subs() -> dict:
-    with _subs_lock:
-        if os.path.exists(SUBS_FILE):
-            try:
-                with open(SUBS_FILE) as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {}
+    if os.path.exists(SUBS_FILE):
+        try:
+            with open(SUBS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
 
 def save_subs(subs: dict):
-    with _subs_lock:
-        with open(SUBS_FILE, "w") as f:
-            json.dump(subs, f, indent=2)
+    with open(SUBS_FILE, "w") as f:
+        json.dump(subs, f, indent=2)
 
 
 def default_prefs():
@@ -291,170 +290,318 @@ def _fetch_universalis(d: date) -> dict | None:
         # skip Gospel Acclamation / Alleluia / Or: / Sequence / Canticle
         if any(skip in raw_header for skip in ["alleluia", "gospel acclamation", "or:", "sequence", "canticle"]):
             continue
-        if raw_header == "first reading" and seen_first_set:
-            break
-        if raw_header == "first reading":
-            seen_first_set = True
 
-        header = UNIV_HEADERS.get(raw_header, ths[0].get_text(strip=True))
-        citation = ths[1].get_text(strip=True) if len(ths) > 1 else ""
+        # only the first set of sections
+        if seen_first_set:
+            continue
+        seen_first_set = True
 
-        # collect text after this table until next hr or table.each
-        texts = []
-        el = table.find_next_sibling()
-        _limit = 100
-        while el and el.name != "hr" and _limit > 0:
-            _limit -= 1
-            if el.name in ("p", "div", "h4", "blockquote"):
-                t = el.get_text("\n", strip=True)
+        for row in table.select("tr"):
+            tds = row.find_all("td")
+            if len(tds) >= 2:
+                citation = tds[0].get_text(" ", strip=True)
+                text = tds[1].get_text("\n", strip=True)
                 for phrase in CLEANUP_PHRASES:
-                    t = t.replace(phrase, "")
-                t = re.sub(r"\n{3,}", "\n\n", t).strip()
-                if t.lower() in ("how to listen", "continue", "listen to the podcast!"):
-                    el = el.find_next_sibling()
-                    continue
-                t_lower = t.lower()
-                if any(kw in t_lower for kw in (
-                    "you can also view this page", "the christian art website",
-                    "each day,", "the readings on this page", "universalis apps",
-                    "new american bible", "english standard version", "set this page to",
-                    "universalis podcast", "episode notes",
-                )):
-                    el = el.find_next_sibling()
-                    continue
-                if el.name == "table" and "each" in (el.get("class") or []):
-                    break
-                if t:
-                    texts.append(t)
-            el = el.find_next_sibling()
+                    text = text.replace(phrase, "")
+                text = re.sub(r"\n{3,}", "\n\n", text).strip()
+                if text:
+                    header = UNIV_HEADERS.get(raw_header, raw_header.title())
+                    sections.append({"header": header, "citation": citation, "text": text})
 
-        full_text = "\n\n".join(texts)
-        if full_text:
-            sections.append({"header": header, "citation": citation, "text": full_text})
+    if not sections:
+        return None
+    return {"title": title, "date": d.isoformat(), "readings": sections, "source": "universalis-html"}
 
-    if sections:
-        data = {"title": title, "date": d.isoformat(), "readings": sections, "source": "universalis"}
+
+# ── fetch orchestration ──────────────────────────────────────────────────────
+def fetch_readings(d: date | None = None) -> dict | None:
+    if d is None:
+        d = today_sgt()
+    # 1) Try Universalis JSONP
+    data = _fetch_universalis_json(d)
+    if data:
+        return data
+    # 2) Try Universalis HTML
+    data = _fetch_universalis(d)
+    if data:
+        return data
+    # 3) Try USCCB
+    data = _fetch_usccb(d)
+    if data:
         return data
     return None
 
 
-# ── cache ───────────────────────────────────────────────────────────────────
-def _load_cache() -> dict:
+def load_readings_cache() -> dict:
     try:
         with open(CACHE_FILE) as f:
-            return json.load(f)
+            raw = json.load(f)
     except Exception:
         return {}
+    if isinstance(raw, dict) and isinstance(raw.get("dates"), dict):
+        return raw["dates"]
+    if isinstance(raw, dict) and raw.get("date") and raw.get("readings"):
+        return {raw["date"]: raw}
+    return {}
 
 
-def _save_cache(cache: dict):
+def save_readings_cache(cache: dict):
     with open(CACHE_FILE, "w") as f:
-        json.dump(cache, f, indent=2)
+        json.dump({"dates": cache}, f)
 
 
-def cache_date(d: date) -> dict | None:
-    """Fetch and cache readings for a given date from Universalis."""
+def fetch_readings_cached_for_date(d: date) -> dict | None:
+    cache = load_readings_cache()
     key = d.isoformat()
-    cache = _load_cache()
     if key in cache:
-        return cache[key]  # already cached
-
-    data = _fetch_universalis(d)
+        return cache[key]
+    data = fetch_readings(d)
     if data:
         cache[key] = data
-        _save_cache(cache)
-        log.info(f"cached {key} from Universalis")
+        try:
+            save_readings_cache(cache)
+        except Exception as e:
+            log.warning("Failed to write readings cache: %s", e)
     return data
 
 
-# ── main fetch (cache → universalis jsonp → universalis html → usccb) ────
-def fetch_readings(d: date | None = None) -> dict | None:
-    if d is None:
-        from datetime import datetime
-        d = datetime.now(SGT).date()
-    key = d.isoformat()
-
-    # 0. in-memory cache (hot path — no disk I/O)
-    if key in _mem_cache:
-        return _mem_cache[key]
-
-    # 1. check file cache
-    cache = _load_cache()
-    if key in cache:
-        _mem_cache[key] = cache[key]
-        return cache[key]
-
-    # 2. try Universalis JSONP (structured, no noise)
-    data = _fetch_universalis_json(d)
-    if data:
-        cache[key] = data
-        _save_cache(cache)
-        _mem_cache[key] = data
-        return data
-
-    # 3. fall back to Universalis HTML scraper
-    data = _fetch_universalis(d)
-    if data:
-        cache[key] = data
-        _save_cache(cache)
-        _mem_cache[key] = data
-        return data
-
-    # 4. fall back to USCCB (NAB)
-    data = _fetch_usccb(d)
-    if data:
-        cache[key] = data
-        _save_cache(cache)
-        _mem_cache[key] = data
-        return data
-
-    return None
-
-
+# ── format for telegram ──────────────────────────────────────────────────────
 def format_readings(data: dict, mode: str = "full") -> list[str]:
-    """Return formatted readings as a list of message parts, each under 4000 chars."""
-    MAX_LEN = 4000
-    sections = data.get("readings", [])
-    title = data.get("title", "Daily Mass Readings")
-    date_str = data.get("date", date.today().isoformat())
-
+    parts = []
+    readings = data["readings"]
     if mode == "gospel":
-        gospel = next((s for s in sections if s["header"] == "Gospel"), None)
-        if gospel:
-            return [f"✝️ *Gospel of the Day* — {gospel['citation']}\n\n{gospel['text']}"]
-        return ["No gospel reading found."]
+        readings = [r for r in readings if r["header"] == "Gospel"]
+    for r in readings:
+        parts.append(
+            f"*{r['header']}*\n"
+            + (f"_{r['citation']}_\n" if r.get("citation") else "")
+            + f"{r['text']}"
+        )
+    return parts
 
-    parts = [f"📖 *{title}*", f"🗓 {date_str}\n"]
-    for s in sections:
-        icon = "✝️" if s["header"] == "Gospel" else "🎵" if s["header"] == "Responsorial Psalm" else "📜"
-        parts.append(f"{icon} *{s['header']}* — {s['citation']}")
-        parts.append(f"{s['text']}\n")
 
-    full = "\n".join(parts)
-    # If under limit, return as single message
-    if len(full) <= MAX_LEN:
-        return [full]
+# ── Divine Office ───────────────────────────────────────────────────────────
+OFFICES = {
+    "readings": ("Office of Readings", "readings.htm"),
+    "lauds": ("Morning Prayer (Lauds)", "lauds.htm"),
+    "terce": ("Terce", "terce.htm"),
+    "sext": ("Sext", "sext.htm"),
+    "none": ("None", "none.htm"),
+    "vespers": ("Evening Prayer (Vespers)", "vespers.htm"),
+    "compline": ("Night Prayer (Compline)", "compline.htm"),
+}
 
-    # Split at reading boundaries (every 2 parts after the intro)
-    messages = []
-    current = parts[0]  # title
-    current += "\n" + parts[1]  # date
-    for i in range(2, len(parts), 2):
-        # parts[i] = header line, parts[i+1] = text
-        header = parts[i] if i < len(parts) else ""
-        text = parts[i + 1] if i + 1 < len(parts) else ""
-        chunk = f"\n\n{header}\n{text}"
-        if len(current) + len(chunk) > MAX_LEN:
-            messages.append(current)
-            current = f"📖 *{title}* (cont.)\n\n{header}\n{text}"
+OFFICE_LABELS = {
+    "readings": "Office of Readings",
+    "lauds": "Lauds",
+    "terce": "Terce",
+    "sext": "Sext",
+    "none": "None",
+    "vespers": "Vespers",
+    "compline": "Compline",
+}
+
+
+def today_sgt() -> date:
+    return datetime.now(SGT).date()
+
+
+def office_url(d: date, office_key: str) -> str:
+    _title, page = OFFICES[office_key]
+    return f"https://universalis.com/asia.singapore/{d.strftime('%Y%m%d')}/{page}"
+
+
+def split_office_heading(txt: str) -> dict[str, str]:
+    for prefix in ("Scripture Reading", "First Reading", "Second Reading", "Canticle"):
+        if txt.startswith(prefix + " "):
+            return {"heading": prefix, "subheading": txt[len(prefix):].strip(), "body": ""}
+    return {"heading": txt, "subheading": "", "body": ""}
+
+
+def parse_office_html(html: str) -> tuple[str, str, list[dict[str, str]]]:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    start = soup.find("h1")
+    if not start:
+        return "Divine Office", "", []
+
+    title = " ".join(start.get_text(" ", strip=True).split())
+    sections = [{"heading": title, "subheading": "", "body": ""}]
+    skip_exact = {"Listen to the podcast!", "How to listen", "Continue"}
+
+    for el in start.find_all_next(["h1", "h2", "h3", "h4", "h5", "p", "div", "table"]):
+        txt = " ".join(el.get_text(" ", strip=True).split())
+        if not txt or txt in skip_exact:
+            continue
+        if len(txt) > 500 and ("INTRODUCTION" in txt or "Dates Today" in txt):
+            continue
+        if txt.startswith("The psalms and canticles here are our own translation"):
+            break
+        if txt.startswith("You can also view this page"):
+            break
+        if txt.startswith("Dates Today") or txt == "Dates":
+            break
+
+        if el.name == "h1":
+            continue
+        if el.name == "table" and len(txt) > 120:
+            continue
+        if el.name in {"h2", "h3", "h4", "h5", "table"}:
+            sections.append(split_office_heading(txt))
         else:
-            current += chunk
+            if sections[-1]["body"]:
+                sections[-1]["body"] += "\n" + txt
+            else:
+                sections[-1]["body"] = txt
+
+    text = "\n\n".join(
+        section["heading"]
+        + ("\n" + section.get("subheading", "") if section.get("subheading") else "")
+        + ("\n" + section["body"] if section["body"] else "")
+        for section in sections
+        if section["heading"] or section.get("subheading") or section["body"]
+    )
+    return title, text.strip(), sections
+
+
+def fetch_office(d: date, office_key: str) -> dict | None:
+    url = office_url(d, office_key)
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or r.url != url:
+            log.warning("Universalis office fetch failed: %s -> %s (%s)", url, r.url, r.status_code)
+            return None
+        title, text, sections = parse_office_html(r.text)
+        if not text:
+            return None
+        return {
+            "key": office_key,
+            "label": OFFICE_LABELS[office_key],
+            "title": title,
+            "url": url,
+            "text": text,
+            "sections": sections,
+            "fetched_at": datetime.now(SGT).isoformat(),
+        }
+    except Exception as e:
+        log.warning("Failed to fetch %s: %s", office_key, e)
+        return None
+
+
+def fetch_divine_office(d: date | None = None) -> dict | None:
+    if d is None:
+        d = today_sgt()
+    offices = {}
+    for key in OFFICES:
+        office = fetch_office(d, key)
+        if office:
+            offices[key] = office
+    if not offices:
+        return None
+    return {
+        "date": d.isoformat(),
+        "region": "asia.singapore",
+        "offices": offices,
+    }
+
+
+def fetch_divine_office_cached() -> dict | None:
+    today = today_sgt().isoformat()
+    if os.path.exists(DIVINE_OFFICE_CACHE_FILE):
+        try:
+            with open(DIVINE_OFFICE_CACHE_FILE) as f:
+                cached = json.load(f)
+            if cached.get("date") == today and cached.get("offices"):
+                return cached
+        except Exception:
+            pass
+
+    data = fetch_divine_office(today_sgt())
+    if data:
+        try:
+            with open(DIVINE_OFFICE_CACHE_FILE, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            log.warning("Failed to write Divine Office cache: %s", e)
+    return data
+
+
+def split_telegram_text(text: str, max_len: int = 3900) -> list[str]:
+    if len(text) <= max_len:
+        return [text]
+
+    chunks = []
+    current = ""
+    for block in text.split("\n"):
+        addition = block if not current else "\n" + block
+        if len(current) + len(addition) <= max_len:
+            current += addition
+            continue
+        if current:
+            chunks.append(current)
+            current = block
+        while len(current) > max_len:
+            chunks.append(current[:max_len])
+            current = current[max_len:]
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def escape_html(text: str) -> str:
+    return html_lib.escape(text, quote=False)
+
+
+def format_office_section(section: dict) -> str:
+    heading = escape_html(section.get("heading", "").strip())
+    subheading = escape_html(section.get("subheading", "").strip())
+    body = escape_html(section.get("body", "").strip())
+    title = ""
+    if heading:
+        title = f"<b>{heading}</b>"
+        if subheading:
+            title += f"\n<i>{subheading}</i>"
+    elif subheading:
+        title = f"<i>{subheading}</i>"
+    if title and body:
+        return f"{title}\n\n{body}"
+    if title:
+        return title
+    return body
+
+
+def format_office_messages(office: dict, max_len: int = 3900) -> list[str]:
+    sections = office.get("sections") or []
+    if not sections:
+        return split_telegram_text(escape_html(office["text"]), max_len=max_len)
+
+    messages = []
+    current = ""
+    for section in sections:
+        part = format_office_section(section)
+        if not part:
+            continue
+        addition = part if not current else "\n\n" + part
+        if len(current) + len(addition) <= max_len:
+            current += addition
+            continue
+        if current:
+            messages.append(current)
+        if len(part) <= max_len:
+            current = part
+        else:
+            split_part = split_telegram_text(part, max_len=max_len)
+            messages.extend(split_part[:-1])
+            current = split_part[-1]
     if current:
         messages.append(current)
     return messages
 
 
-# ── truth (curated verses) ─────────────────────────────────────────────────
+# ── truths ───────────────────────────────────────────────────────────────────
+# Verses sourced from OYP (Office of Young People) / NUS Catholic Students Society
 TRUTHS = {
     "peace": [
         ('"Do not be anxious about anything, but in every situation, by prayer and petition, with thanksgiving, present your requests to God. And the peace of God, which transcends all understanding, will guard your hearts and your minds in Christ Jesus."', "Philippians 4:6-7"),
@@ -544,18 +691,18 @@ TRUTHS = {
         ('So as to live for the rest of the time in the flesh no longer \nfor human passions but for the will of God', '1 Peter 4:2'),
         ('The end of all things is near. Therefore be clear minded \nand self-controlled so that you can pray', '1 Peter 4:7-8'),
         ('And after you have suffered a little while, the God of all grace, \nwho has called you to his eternal glory in Christ, \nwill himself restore, confirm, strengthen, and establish you.', '1 Peter 5:10'),
-        ('Clothe yourselves, all of you, with humility toward one another, \nfor “God opposes the proud but gives grace to the humble.”', '1 Peter 5:5'),
+        ('Clothe yourselves, all of you, with humility toward one another, \nfor "God opposes the proud but gives grace to the humble."', '1 Peter 5:5'),
         ('Humble yourselves, therefore, under the mighty hand of God \nso that at the proper time he may exalt you, \ncasting all your anxieties on him, because he cares for you.', '1 Peter 5:6-7'),
         ('Be sober-minded; be watchful. Your adversary the devil \nprowls around like a roaring lion, seeking someone to devour.\nResist him, firm in your faith, knowing that the same kinds of \nsuffering are being experienced by your brotherhood throughout the world.', '1 Peter 5:8-9'),
         ('Who comforts us in all our affliction, so that we may be able to comfort those \nwho are in any affliction, with the comfort with\n which we ourselves are comforted by God', '2 Corinthians 1:4'),
         ('For the sake of Christ, then, I am content with weaknesses, \ninsults, hardships, persecutions, and calamities. \nFor when I am weak, then I am strong.', '2 Corinthians 12:10'),
-        ('“My grace is sufficient for you, for my power is made perfect in weakness.” \nTherefore I will boast all the more gladly of my weaknesses, \nso that the power of Christ may rest upon me.', '2 Corinthians 12:9'),
+        ('"My grace is sufficient for you, for my power is made perfect in weakness." \nTherefore I will boast all the more gladly of my weaknesses, \nso that the power of Christ may rest upon me.', '2 Corinthians 12:9'),
         ('Therefore, if anyone is in Christ, he is a new creation.\nThe old has passed away; behold, the new has come', '2 Corinthians 5:17'),
         ('For God gave us a spirit not of fear but of power and love and self-control.', '2 Timothy 1:7'),
-        ('In all things I have shown you that by working hard in this way \nwe must help the weak and remember the words of the Lord Jesus, \nhow he himself said, ‘It is more blessed to give than to receive.’”', 'Acts 20:35'),
+        ('In all things I have shown you that by working hard in this way \nwe must help the weak and remember the words of the Lord Jesus, \nhow he himself said, \'It is more blessed to give than to receive.\'', 'Acts 20:35'),
         ('but you will receive the power of the Holy Spirit which will come on you,\nand then you will be my witnesses not only in Jerusalem \nbut throughout Judaea and Samaria, and indeed to earth\'s remotest end', 'Acts 1:8'),
         ('In the last days -- the Lord declares -- I shall pour out my Spirit on all humanity.\nYour sons and daughters shall prophesy, your young people shall see visions, \nyour old people dream dreams.', 'Acts 2:17'),
-        ('Therefore, as God’s chosen people, holy and dearly loved, \nclothe yourselves with compassion, kindness, humility, gentleness and patience', 'Colossians 3:12'),
+        ('Therefore, as God\'s chosen people, holy and dearly loved, \nclothe yourselves with compassion, kindness, humility, gentleness and patience', 'Colossians 3:12'),
         ('Bear with each other and forgive one another if any of you \nhas a grievance against someone. Forgive as the Lord forgave you.', 'Colossians 3:13'),
         ('And over all these virtues put on love, \nwhich binds them all together in perfect unity', 'Colossians 3:14'),
         ('Let the peace of Christ rule in your hearts, \nsince as members of one body you were called to peace. And be thankful.', 'Colossians 3:15'),
@@ -603,7 +750,7 @@ TRUTHS = {
         ('Then a shoot will spring from the stem of Jesse,                           \nAnd a branch from his roots will bear fruit', 'Isaiah 11:1'),
         ('Behold, God is my salvation; I will trust, and will not be afraid; \nfor the Lord God is my strength and my song, and he has become my salvation', 'Isaiah 12:2'),
         ('Strengthen the feeble hands, steady the knees that give way;', 'Isaiah 35:3'),
-        ('Say to those with fearful hearts,“Be strong, \nDo not fear; your God will come,\nhe will come with vengeance; \nwith divine retribution he will come to save you.”', 'Isaiah 35:4'),
+        ('Say to those with fearful hearts,"Be strong, \nDo not fear; your God will come,\nhe will come with vengeance; \nwith divine retribution he will come to save you."', 'Isaiah 35:4'),
         ('He tends his flock like a shepherd:\nHe gathers the lambs in his arms and carries them close to his heart; \nhe gently leads those that have young.', 'Isaiah 40:11'),
         ('He gives strength to the weary, he strengthens the powerless.', 'Isaiah 40:29'),
         ('In the wilderness prepare the way for the Lord;\nmake straight in the desert a highway for our God.', 'Isaiah 40:3'),
@@ -613,14 +760,14 @@ TRUTHS = {
         ('Fear not, for I am with you; be not dismayed, for I am your God;\nI will strengthen you, I will help you, I will uphold you with my righteous right hand', 'Isaiah 41:10'),
         ('I have blotted out your transgressions like a cloud and your sins like mist; \nreturn to me, for I have redeemed you', 'Isaiah 44:22'),
         ('We all, like sheep, have gone astray, each of us has turned to our own way;\nand the Lord has laid on him the iniquity of us all.', 'Isaiah 53:6'),
-        ('Then I heard the voice of the Lord saying, \n“Whom shall I send? And who will go for us?”\nAnd I said, “Here am I. Send me!”', 'Isaiah 6:8'),
+        ('Then I heard the voice of the Lord saying, \n"Whom shall I send? And who will go for us?"\nAnd I said, "Here am I. Send me!"', 'Isaiah 6:8'),
         ('Arise, shine, for your light has come,\nand the glory of the Lord rises upon you.', 'Isaiah 60:1'),
         ('See, darkness covers the earth and thick darkness is over the peoples,\nbut the Lord rises upon you and his glory appears over you.', 'Isaiah 60:2'),
         ('But now, O LORD, You are our Father, \nWe are the clay, and You our potter; \nAnd all of us are the work of Your hand.', 'Isaiah 64:8'),
         ('Ask the Lord your God for a sign, \nwhether in the deepest depths or in the highest heights.', 'Isaiah 7:11'),
         ('Therefore the Lord himself will give you a sign: \nThe virgin will conceive and give birth to a son, \nand will call him Immanuel.', 'Isaiah 7:14'),
         ('The people walking in darkness have seen a great light;\non those living in the land of deep darkness a light has dawned', 'Isaiah 9:2'),
-        ('For as in the day of Midian’s defeat,\nyou have shattered the yoke that burdens them,\nthe bar across their shoulders, the rod of their oppressor.', 'Isaiah 9:4'),
+        ('For as in the day of Midian\'s defeat,\nyou have shattered the yoke that burdens them,\nthe bar across their shoulders, the rod of their oppressor.', 'Isaiah 9:4'),
         ('Humble yourselves before the Lord, and he will exalt you', 'James 4:10'),
         ('Submit yourselves therefore to God. \nResist the devil, and he will flee from you.', 'James 4:7'),
         ('Draw near to God, and he will draw near to you. Cleanse your hands, \nyou sinners, and purify your hearts, you double-minded.', 'James 4:8'),
@@ -649,13 +796,13 @@ TRUTHS = {
         ('For God did not send his Son into the world to condemn the world, \nbut in order that the world might be saved through him', 'John 3:17'),
         ('Be strong and courageous. Do not be frightened, \nand do not be dismayed, for the Lord your God is with you wherever you go', 'Joshua 1:9'),
         ('Nothing is impossible for God', 'Luke 1:37'),
-        ('And Mary said, “Behold, I am the servant of the Lord; \nlet it be to me according to your word.”', 'Luke 1:38'),
+        ('And Mary said, "Behold, I am the servant of the Lord; \nlet it be to me according to your word."', 'Luke 1:38'),
         ('So therefore, any one of you who does not renounce \nall that he has cannot be my disciple', 'Luke 14:33'),
         ('But while he was still a long way off, his father saw him and felt compassion. \nand ran and embraced him and kissed him.', 'Luke 15:20'),
         ('Just so, I tell you, there will be more joy in heaven over 1 sinner who repents\nthan over 99 righteous persons who need no repentance', 'Luke 15:7'),
         ('For everyone who exalts himself will be humbled, \nbut the one who humbles himself will be exalted', 'Luke 18:14'),
         ('Do not be afraid.                                                                          \nI bring you good news that will cause great joy for all the people', 'Luke 2:10'),
-        ('Glory to God in the highest heaven,                                               \nand on earth peace to those on whom his favor rests.', 'Luke 2:14'),
+        ('Glory to God in the highest heaven,                                               \non earth peace to those on whom his favor rests.', 'Luke 2:14'),
         ('Father, into your hands I commit my spirit!', 'Luke 23:46'),
         ('If anyone would come after me, \nlet him deny himself and take up his cross daily and follow me. \nFor whoever would save his life will lose it, \nbut whoever loses his life for my sake will save it.', 'Luke 9:23-24'),
         ('Come to me, all you who labour and are overburdened, and I will give you rest.', 'Matthew 11:28'),
@@ -693,13 +840,13 @@ TRUTHS = {
         ('Look at the birds in the sky. They do not sow or reap or gather into barns; \nyet your heavenly Father feeds them. Are you not worth much more than they are?', 'Matthew 6:26'),
         ('Set your hearts on his kingdom first, and on God\'s saving justice, \nand all these other things will be given you as well.', 'Matthew 6:33'),
         ('Ask, and it will be given to you; search, and you will find; \nknock, and the door will be opened to you.', 'Matthew 7:7'),
-        ('And he said to them, \'Why are you so frightened, you who have so little faith?\' \nAnd then he stood up and rebuked the winds and the sea; and there was a great calm.', 'Matthew 8:26'),
+        ('And he said to them, \'Why are you so frightened, you who have so little faith?\'\nAnd then he stood up and rebuked the winds and the sea; and there was a great calm.', 'Matthew 8:26'),
         ('Go and learn the meaning of the words: Mercy is what pleases me, \nnot sacrifice. And indeed I came to call not the upright, but sinners.\'', 'Matthew 9:13'),
         ('And when Jesus reached the house the blind men came up to him and he said to them, \n\'Do you believe I can do this?\' They said, \'Lord, we do.\'\nThen he touched their eyes saying, \'According to your faith, let it be done to you.\'', 'Matthew 9:28-29'),
         ('Then he said to his disciples, \'The harvest is rich but the labourers are few, \nso ask the Lord of the harvest to send out labourers to his harvest.', 'Matthew 9:37'),
         ('Jesus, Son of David, have mercy on me', 'Mark 10:47'),
         ('Therefore keep watch because you do not know when\n the owner of the house will come back —whether in the evening,\nor at midnight, or when the rooster crows, or at dawn.', 'Mark 13:35'),
-        ('If he comes suddenly, do not let him find you sleeping. \nWhat I say to you, I say to everyone: ‘Watch!’', 'Mark 13:36-37'),
+        ('If he comes suddenly, do not let him find you sleeping. \nWhat I say to you, I say to everyone: \'Watch!\'', 'Mark 13:36-37'),
         ('Abba, Father, all things are possible for you.\nRemove this cup from me. Yet not what I will, but what you will.', 'Mark 14:36'),
         ('Do not fear, only believe', 'Mark 5:36'),
         ('If anyone would come after me, let him deny himself and take up \nhis cross and follow me. For whoever would save his life will lose it, \nbut whoever loses his life for my sake and the gospel\'s will save it.', 'Mark 8:34-35'),
@@ -708,14 +855,14 @@ TRUTHS = {
         ('Come to me, all who labor and are heavy laden, and I will give you rest. \nTake my yoke upon you, and learn from me, \nfor I am gentle and lowly in heart, and you will find rest for your souls.', 'Matthew 11:28-29'),
         ('Take my yoke upon you, and learn from me, \nfor I am gentle and lowly in heart, and you will find rest for your souls.', 'Matthew 11:29'),
         ('Blessed is anyone who does not stumble on account of me', 'Matthew 11:6'),
-        ('He said, “Come.” So Peter got out of the boat and \nwalked on the water and came to Jesus', 'Matthew 14:29'),
+        ('He said, "Come." So Peter got out of the boat and \nwalked on the water and came to Jesus', 'Matthew 14:29'),
         ('If anyone wishes to come after Me, \nhe must deny himself, and take up his cross and follow Me. \nFor whoever wishes to save his life will lose it;\nbut whoever loses his life for My sake will find it.', 'Matthew 16:24-25'),
         ('So the last will be first, and the first last', 'Matthew 20:16'),
         ('My Father, if it be possible, let this cup pass from me; \nnevertheless, not as I will, but as you will.', 'Matthew 26:39'),
         ('Repent, for the kingdom of heaven is at hand', 'Matthew 3:2'),
         ('Prepare the way for the Lord, make straight paths for him', 'Matthew 3:3'),
         ('But seek first the kingdom of God and his righteousness, \nand all these things will be added to you.', 'Matthew 6:33'),
-        ('Not everyone who says to me, ‘Lord, Lord,’ will enter the kingdom of heaven, \nbut the one who does the will of my Father who is in heaven.', 'Matthew 7:21'),
+        ('Not everyone who says to me, \'Lord, Lord,\' will enter the kingdom of heaven, \nbut the one who does the will of my Father who is in heaven.', 'Matthew 7:21'),
         ('Do all things without grumbling or questioning, \nthat you may be blameless and innocent, children of God \nwithout blemish in the midst of a crooked and twisted generation, \namong whom you shine as lights in the world.', 'Philippians 2:14-15'),
         ('I can do all things through him who strengthens me', 'Philippians 4:13'),
         ('Do not be anxious about anything, but in everything \nby prayer and supplication with thanksgiving \nlet your requests be made known to God.', 'Philippians 4:6'),
@@ -743,7 +890,7 @@ TRUTHS = {
         ('For you equipped me with strength for the battle;\nyou made those who rise against me sink under me', 'Psalms 18:39'),
         ('In my distress I called upon the Lord; to my God I cried for help.\nFrom his temple he heard my voice, and my cry to him reached his ears.', 'Psalms 18:6'),
         ('Even though I walk through the valley of the shadow of death,\nI will fear no evil, for you are with me;\nyour rod and your staff, they comfort me.', 'Psalms 23:4'),
-        ('The earth is the Lord’s, and everything in it,\nthe world, and all who live in it;', 'Psalms 24:1'),
+        ('The earth is the Lord\'s, and everything in it,\nthe world, and all who live in it;', 'Psalms 24:1'),
         ('Who may ascend the mountain of the Lord? \nWho may stand in his holy place?\nThe one who has clean hands and a pure heart,\n who does not trust in an idol or swear by a false god.', 'Psalms 24:3-4'),
         ('The Lord is my light and my salvation— whom shall I fear?\nThe Lord is the stronghold of my life— of whom shall I be afraid?', 'Psalms 27:1'),
         ('Though an army besiege me, my heart will not fear;\nthough war break out against me, even then I will be confident.', 'Psalms 27:3'),
@@ -752,16 +899,28 @@ TRUTHS = {
         ('You are my hiding place; you will protect me from trouble \nand surround me with songs of deliverance.', 'Psalms 32:7'),
         ('The Lord is near to the brokenhearted and saves the crushed in spirit', 'Psalms 34:18'),
         ('Rest in the LORD and wait patiently for Him; \nDo not fret because of him who prospers in his way, \nBecause of the man who carries out wicked schemes.', 'Psalms 37:7'),
-        ('Why are you down in the dumps, dear soul?\nWhy are you crying the blues?\nFix my eyes on God— soon I’ll be praising again.\nHe puts a smile on my face. He’s my God.', 'Psalms 43:5'),
+        ('Why are you down in the dumps, dear soul?\nWhy are you crying the blues?\nFix my eyes on God— soon I\'ll be praising again.\nHe puts a smile on my face. He\'s my God.', 'Psalms 43:5'),
         ('And call upon me in the day of trouble; \nI will deliver you, and you shall glorify me.', 'Psalms 50:15'),
         ('When I am afraid, I put my trust in you. \nIn God, whose word I praise, in God I trust; I shall not be afraid.', 'Psalms 56:3-4'),
-        ('When he calls to me, I will answer him; I will be with him in trouble;\nI will rescue him and honor him. With long life I will satisfy him\nand show him my salvation.', 'Psalms 9:15-16'),
-        ('Because you have made the Lord your dwelling place— the Most High, \nwho is my refuge —  no evil shall be allowed to befall you,\nno plague come near your tent.', 'Psalms 9:9-10'),
-        ('I will say to the Lord, “My refuge and my fortress,\nmy God, in whom I trust.”', 'Psalms 91:2'),
+        ('When he calls to me, I will answer him; I will be with him in trouble;\nI will rescue him and honor him. With long life I will satisfy him\nand show him my salvation.', 'Psalms 91:15-16'),
+        ('Because you have made the Lord your dwelling place— the Most High, \nwho is my refuge —  no evil shall be allowed to befall you,\nno plague come near your tent.', 'Psalms 91:9-10'),
+        ('I will say to the Lord, "My refuge and my fortress,\nmy God, in whom I trust."', 'Psalms 91:2'),
         ('For he will deliver you from the snare of the fowler\nand from the deadly pestilence.', 'Psalms 91:3'),
         ('He will cover you with his pinions,\nand under his wings you will find refuge;his faithfulness is a shield and buckler.', 'Psalms 91:4'),
         ('For he is our God, and we are the people of his pasture,\nand the sheep of his hand.', 'Psalms 95:7'),
         ('Today, if you hear his voice,\ndo not harden your hearts, as at Meribah,', 'Psalms 95:7-8'),
+        ('They are like trees planted by streams of water, which yield their fruit in its season, \nand their leaves do not wither. In all that they do, they prosper.', 'Psalms 1:3'),
+        ('O Lord, you have searched me and known me. You know when I sit down and when I rise up; \nyou discern my thoughts from far away. You search out my path and my lying down, \nand are acquainted with all my ways.', 'Psalms 139:1-3'),
+        ('Even before a word is on my tongue, O Lord, you know it completely. \nYou hem me in, behind and before, and lay your hand upon me. \nSuch knowledge is too wonderful for me; it is so high that I cannot attain it', 'Psalms 139:4-6'),
+        ('Where can I go from your spirit? Or where can I flee from your presence?', 'Psalms 139:7'),
+        ('For it was you who formed my inward parts; you knit me together in my mother\'s womb.\nI praise you, for I am fearfully and wonderfully made. Wonderful are your works;\nthat I know very well.', 'Psalms 139:13-14'),
+        ('Search me, O God, and know my heart; test me and know my thoughts. \nSee if there is any wicked way in me, and lead me in the way everlasting', 'Psalms 139:23-24'),
+        ('Create in me a clean heart, O God, and put a new and right spirit within me.\nDo not cast me away from your presence, and do not take your holy spirit from me.\nRestore to me the joy of your salvation, and sustain in me a willing spirit.', 'Psalms 51:10-12'),
+        ('You desire truth in the inward being; therefore teach me wisdom in my secret heart.', 'Psalms 51:6'),
+        ('How lovely is your dwelling place, O Lord of hosts!\nMy soul longs, indeed it faints for the courts of the Lord; \nmy heart and my flesh sing for joy to the living God', 'Psalms 84:1-2'),
+        ('Will you not revive us again, so that your people may rejoice in you? \nShow us your steadfast love, O Lord, and grant us your salvation.', 'Psalms 85:6-7'),
+        ('Let me hear what God the Lord will speak, for he will speak peace to his people, \nto his faithful, to those who turn to him in their hearts.', 'Psalms 85:8'),
+        ('For the Lord God is a sun and shield; he bestows favor and honor. \nNo good thing does the Lord withhold from those who walk uprightly.', 'Psalms 84:11'),
         ('He will wipe away every tear from their eyes, and death shall be no more,\n neither shall there be mourning, nor crying, nor pain anymore, \nfor the former things have passed away.', 'Revelation 21:4'),
         ('Therefore I urge you, brethren, by the mercies of God,\nto present your bodies a living and holy sacrifice, \nacceptable to God, which is your spiritual service of worship.', 'Romans 12:1'),
         ('Do not be conformed to this world, but be transformed by \nthe renewal of your mind, that by testing you may \ndiscern what is the will of God, \nwhat is good and acceptable and perfect.', 'Romans 12:2'),
@@ -770,8 +929,8 @@ TRUTHS = {
         ('Rather, clothe yourselves with the Lord Jesus Christ, \nand do not think about how to gratify the desires of the flesh.', 'Romans 13:14'),
         ('May the God of hope fill you with all joy and peace in believing, \nso that by the power of the Holy Spirit you may abound in hope', 'Romans 15:13'),
         ('Accept one another, then, just as Christ accepted you, \nin order to bring praise to God', 'Romans 15:7'),
-        ('Let not sin therefore reign in your mortal body, to make you obey its passions', 'Romans 5:12'),
-        ('For sin will have no dominion over you, \nsince you are not under law but under grace', 'Romans 5:14'),
+        ('Let not sin therefore reign in your mortal body, to make you obey its passions', 'Romans 6:12'),
+        ('For sin will have no dominion over you, \nsince you are not under law but under grace', 'Romans 6:14'),
         ('More than that, we rejoice in our sufferings, knowing that suffering \nproduces endurance, and endurance produces character, \nand character produces hope', 'Romans 5:3-4'),
         ('We rejoice in our sufferings,knowing that suffering produces endurance, \nand endurance produces character, and character produces hope, \nand hope does not put us to shame.', 'Romans 5:3-5'),
         ('But God shows his love for us in that while we were still sinners, \nChrist died for us.', 'Romans 5:8'),
@@ -781,81 +940,69 @@ TRUTHS = {
         ('For I consider that the sufferings of this present time \nare not worth comparing with the glory that is to be revealed to us.', 'Romans 8:18'),
         ('And we know that for those who love God all things work together for good, \nfor those who are called according to his purpose.', 'Romans 8:28'),
         ('For I am sure that neither death nor life, nor angels nor rulers, \nnor things present nor things to come, nor powers, nor height nor depth, \nnor anything else in all creation, will be able to separate us \nfrom the love of God in Christ Jesus our Lord.', 'Romans 8:38-39'),
-        ('For the grace of God has appeared that offers salvation to all people.\nIt teaches us to say “No” to ungodliness and worldly passions, \nand to live self-controlled, upright and godly lives in this present age,', 'Titus 2:11-12'),
+        ('For the grace of God has appeared that offers salvation to all people.\nIt teaches us to say "No" to ungodliness and worldly passions, \nand to live self-controlled, upright and godly lives in this present age,', 'Titus 2:11-12'),
         ('Who gave himself for us to redeem us from all wickedness \nand to purify for himself a people that are his very own, \neager to do what is good.', 'Titus 2:14'),
         ('He saved us, not because of works done by us in righteousness, \nbut according to his own mercy, \nby the washing of regeneration and renewal of the Holy Spirit,', 'Titus 3:5'),
         ('The Lord has taken away your punishment, he has turned back your enemy.\nThe Lord, the King of Israel, is with you; never again will you fear any harm.', 'Zephaniah 3:15'),
         ('The Lord your God is with you, the Mighty Warrior who saves.\nHe will take great delight in you; in his love he will no longer rebuke you,\nbut will rejoice over you with singing', 'Zephaniah 3:17'),
-        ('They are like trees planted by streams of water, which yield their fruit in its season, \nand their leaves do not wither. In all that they do, they prosper.', 'Psalms 1:3'),
-        ('O Lord, you have searched me and known me. You know when I sit down and when I rise up; \nyou discern my thoughts from far away. You search out my path and my lying down, \nand are acquainted with all my ways.', 'Psalms 139:1-3'),
-        ('Even before a word is on my tongue, O Lord, you know it completely. \nYou hem me in, behind and before, and lay your hand upon me. \nSuch knowledge is too wonderful for me; it is so high that I cannot attain it', 'Psalms 139:4-6'),
-        ('Where can I go from your spirit? Or where can I flee from your presence?', 'Psalms 139:7'),
-        ('For it was you who formed my inward parts; you knit me together in my mother’s womb.\nI praise you, for I am fearfully and wonderfully made. Wonderful are your works;\nthat I know very well.', 'Psalms 139:13-14'),
-        ('Search me, O God, and know my heart; test me and know my thoughts. \nSee if there is any wicked way in me, and lead me in the way everlasting', 'Psalms 139:23-24'),
-        ('Just as he chose us in Christ before the foundation of the world to be holy and \nblameless before him in love. He destined us for adoption as his children through \nJesus Christ, according to the good pleasure of his will, to the praise of his \nglorious grace that he freely bestowed on us in the Beloved.', 'Ephesians 1:4-6'),
-        ('In him we have redemption through his blood, the forgiveness of our trespasses, \naccording to the riches of his grace that he lavished on us.', 'Ephesians 1:7-8'),
+        ('Just as he chose us in Christ before the foundation of the world to be holy and \nblameless before him in love. He destined us for adoption as his children through \nJesus Christ, according to the good pleasure of his will, to the praise of his \nglorious grace that he freely bestowed on us in the Beloved.', 'Ephesians 1:4-6'),
+        ('In him we have redemption through his blood, the forgiveness of our trespasses, \naccording to the riches of his grace that he lavished on us.', 'Ephesians 1:7-8'),
         ('In Christ we have also obtained an inheritance, having been destined according to the\npurpose of him who accomplishes all things according to his counsel and will, \nso that we, who were the first to set our hope on Christ, might live for the praise of his glory.', 'Ephesians 1:11-12'),
-        ('Therefore be imitators of God, as beloved children, and live in love, \nas Christ loved us and gave himself up for us, a fragrant offering and sacrifice to God.', 'Ephesians 5:1-2'),
-        ('Create in me a clean heart, O God, and put a new and right spirit within me.\nDo not cast me away from your presence, and do not take your holy spirit from me.\nRestore to me the joy of your salvation, and sustain in me a willing spirit.', 'Psalms 51:10-12'),
-        ('You desire truth in the inward being; therefore teach me wisdom in my secret heart.', 'Psalms 51:6'),
-        ('Always be ready to make your defense to anyone who demands from you an\n accounting for the hope that is in you; yet do it with gentleness and reverence.', '1 Peter 3:15-16'),
+        ('Therefore be imitators of God, as beloved children, and live in love, \nas Christ loved us and gave himself up for us, a fragrant offering and sacrifice to God.', 'Ephesians 5:1-2'),
+        ('Always be ready to make your defense to anyone who demands from you an\n accounting for the hope that is in you; yet do it with gentleness and reverence.', '1 Peter 3:15-16'),
         ('I am confident of this, that the one who began a good work among \nyou will bring it to completion by the day of Jesus Christ.', 'Philippians 1:6'),
-        ('This was in accordance with the eternal purpose that he has carried out in\nChrist Jesus our Lord, in whom we have access to God in boldness and\nconfidence through faith in him.', 'Ephesians 3:11-12'),
-        ('For all who are led by the Spirit of God are children of God. \nFor you did not receive a spirit of slavery to fall back into fear, \nbut you have received a spirit of adoption. When we cry, “Abba! Father!”', 'Romans 8:14-15'),
-        ('For in hope we were saved. Now hope that is seen is not hope. For who hopes for what is seen? \nBut if we hope for what we do not see, we wait for it with patience.', 'Romans 8:24-25'),
-        ('Then your light shall break forth like the dawn, and your healing shall spring up quickly;\n your vindicator shall go before you, the glory of the Lord shall be your rear guard.', 'Isaiah 58:8'),
+        ('This was in accordance with the eternal purpose that he has carried out in\nChrist Jesus our Lord, in whom we have access to God in boldness and\nconfidence through faith in him.', 'Ephesians 3:11-12'),
+        ('For all who are led by the Spirit of God are children of God. \nFor you did not receive a spirit of slavery to fall back into fear, \nbut you have received a spirit of adoption. When we cry, "Abba! Father!"', 'Romans 8:14-15'),
+        ('For in hope we were saved. Now hope that is seen is not hope. For who hopes for what is seen? \nBut if we hope for what we do not see, we wait for it with patience.', 'Romans 8:24-25'),
+        ('Then your light shall break forth like the dawn, and your healing shall spring up quickly;\n your vindicator shall go before you, the glory of the Lord shall be your rear guard.', 'Isaiah 58:8'),
         ('Then you shall call, and the Lord will answer; you shall cry for help, and he will say, Here I am.', 'Isaiah 58:9'),
         ('The Lord will guide you continually, and satisfy your needs in parched places,\nand make your bones strong; and you shall be like a watered garden,\nlike a spring of water, whose waters never fail.', 'Isaiah 58:11'),
-        ('I will greatly rejoice in the Lord, my whole being shall exult in my God;\nfor he has clothed me with the garments of salvation, \nhe has covered me with the robe of righteousness, as a bridegroom decks himself with a garland, \nand as a bride adorns herself with her jewels.', 'Isaiah 61:10'),
-        ('Love is patient; love is kind; love is not envious or boastful or arrogant or rude.\nIt does not insist on its own way; it is not irritable or resentful;\nit does not rejoice in wrongdoing, but rejoices in the truth.\nIt bears all things, believes all things, hopes all things, endures all things. Love never ends.', '1 Corinthians 13:4-8'),
+        ('I will greatly rejoice in the Lord, my whole being shall exult in my God;\nfor he has clothed me with the garments of salvation, \nhe has covered me with the robe of righteousness, as a bridegroom decks himself with a garland, \nand as a bride adorns herself with her jewels.', 'Isaiah 61:10'),
+        ('Love is patient; love is kind; love is not envious or boastful or arrogant or rude.\nIt does not insist on its own way; it is not irritable or resentful;\nit does not rejoice in wrongdoing, but rejoices in the truth.\nIt bears all things, believes all things, hopes all things, endures all things. Love never ends.', '1 Corinthians 13:4-8'),
         ('God is our refuge and strength, a very present help in trouble. Therefore we will not fear.', 'Psalms 46:1-2'),
-        ('“Be still, and know that I am God! I am exalted among the nations, I am exalted in the earth.” \nThe Lord of hosts is with us; the God of Jacob is our refuge.', 'Psalms 46:10-11'),
-        ('Know that the Lord is God. It is he that made us, and we are his;\nwe are his people, and the sheep of his pasture.', 'Psalms 100:3'),
+        ('"Be still, and know that I am God! I am exalted among the nations, I am exalted in the earth." \nThe Lord of hosts is with us; the God of Jacob is our refuge.', 'Psalms 46:10-11'),
+        ('Know that the Lord is God. It is he that made us, and we are his;\nwe are his people, and the sheep of his pasture.', 'Psalms 100:3'),
         ('For the Lord is good; his steadfast love endures forever, and his faithfulness to all generations.', 'Psalms 100:5'),
-        ('I will walk with integrity of heart within my house;\nI will not set before my eyes anything that is base.', 'Psalms 101:2-3'),
-        ('But my eyes are turned toward you, O God, my Lord; in you I seek refuge;\ndo not leave me defenseless.  Keep me from the trap that they have laid for me,\nand from the snares of evildoers.', 'Psalms 141:8-9'),
+        ('I will walk with integrity of heart within my house;\nI will not set before my eyes anything that is base.', 'Psalms 101:2-3'),
+        ('But my eyes are turned toward you, O God, my Lord; in you I seek refuge;\ndo not leave me defenseless. Keep me from the trap that they have laid for me,\nand from the snares of evildoers.', 'Psalms 141:8-9'),
         ('So if you have been raised with Christ, seek the things that are above, \nwhere Christ is, seated at the right hand of God.', 'Colossians 3:1'),
-        ('Set your minds on things that are above, not on things that are on earth, \nfor you have died, and your life is hidden with Christ in God.', 'Colossians 3:2-3'),
+        ('Set your minds on things that are above, not on things that are on earth, \nfor you have died, and your life is hidden with Christ in God.', 'Colossians 3:2-3'),
         ('When Christ who is your life is revealed, then you also will be revealed with him in glory.', 'Colossians 3:4'),
-        ('My child, when you come to serve the Lord, prepare yourself for testing. \nSet your heart right and be steadfast, and do not be impetuous in time of calamity.', 'Sirach 2:1-2'),
+        ('My child, when you come to serve the Lord, prepare yourself for testing. \nSet your heart right and be steadfast, and do not be impetuous in time of calamity.', 'Sirach 2:1-2'),
         ('Accept whatever befalls you, and in times of humiliation be patient. \nFor gold is tested in the fire, and those found acceptable, in the furnace of humiliation.', 'Sirach 2:4-5'),
-        ('Trust in him, and he will help you; make your ways straight, and hope in him.', 'Sirach 2:6'),
+        ('Trust in him, and he will help you; make your ways straight, and hope in him.', 'Sirach 2:6'),
         ('You who fear the Lord, wait for his mercy; do not stray, or else you may fall.', 'Sirach 2:7'),
-        ('In this you rejoice, even if now for a little while you have had to suffer various trials, \nso that the genuineness of your faith—being more precious than gold that,\nthough perishable, is tested by fire—may be found to result in praise\nand glory and honor when Jesus Christ is revealed.', '1 Peter 1:6-7'),
+        ('In this you rejoice, even if now for a little while you have had to suffer various trials, \nso that the genuineness of your faith—being more precious than gold that,\nthough perishable, is tested by fire—may be found to result in praise\nand glory and honor when Jesus Christ is revealed.', '1 Peter 1:6-7'),
         ('Although you have not seen him, you love him; and even though you do not see him now, \nyou believe in him and rejoice with an indescribable and glorious joy.', '1 Peter 1:8'),
         ('for you are receiving the outcome of your faith, the salvation of your souls.', '1 Peter 1:9'),
         ('Therefore prepare your minds for action; discipline yourselves; \nset all your hope on the grace that Jesus Christ will bring you when he is revealed.', '1 Peter 1:13'),
-        ('Instead, as he who called you is holy, be holy yourselves in all your conduct; \nfor it is written, “You shall be holy, for I am holy.”', '1 Peter 1:15-16'),
+        ('Instead, as he who called you is holy, be holy yourselves in all your conduct; \nfor it is written, "You shall be holy, for I am holy."', '1 Peter 1:15-16'),
         ('You know that you were ransomed from the futile ways inherited from your ancestors, \nnot with perishable things like silver or gold, but with the precious blood of Christ, \nlike that of a lamb without defect or blemish.', '1 Peter 1:18-19'),
         ('Through him you have come to trust in God, who raised him from the dead and gave him glory, \nso that your faith and hope are set on God.', '1 Peter 1:21'),
         ('Now that you have purified your souls by your obedience to the truth \nso that you have genuine mutual love, love one another deeply from the heart.', '1 Peter 1:22'),
         ('You have been born anew, not of perishable but of imperishable seed, \nthrough the living and enduring word of God.', '1 Peter 1:23'),
-        ('For “All flesh is like grass and all its glory like the flower of grass.\nThe grass withers, and the flower falls, but the word of the Lord endures forever.”', '1 Peter 1:24-25'),
-        ('Come to him, a living stone, though rejected by mortals yet \nchosen and precious in God’s sight.', '1 Peter 2:4'),
+        ('For "All flesh is like grass and all its glory like the flower of grass.\nThe grass withers, and the flower falls, but the word of the Lord endures forever."', '1 Peter 1:24-25'),
+        ('Come to him, a living stone, though rejected by mortals yet \nchosen and precious in God\'s sight.', '1 Peter 2:4'),
         ('Like living stones, let yourselves be built into a spiritual house, to be a holy priesthood, \nto offer spiritual sacrifices acceptable to God through Jesus Christ.', '1 Peter 2:5'),
-        ('Once you were not a people, but now you are God’s people; \nonce you had not received mercy, but now you have received mercy.', '1 Peter 2:10'),
+        ('Once you were not a people, but now you are God\'s people; \nonce you had not received mercy, but now you have received mercy.', '1 Peter 2:10'),
         ('He himself bore our sins in his body on the cross, so that, free from sins, \nwe might live for righteousness; by his wounds you have been healed.', '1 Peter 2:24'),
         ('For you were going astray like sheep, but now you have returned to the\nshepherd and guardian of your souls.', '1 Peter 2:25'),
         ('His divine power has given us everything needed for life and godliness, \nthrough the knowledge of him who called us by his own glory and goodness.', '2 Peter 1:3'),
-        ('For this very reason, you must make every effort to support your faith\nwith goodness, and goodness with knowledge, and knowledge with self-control,\nand self-control with endurance, and endurance with godliness,\nand godliness with mutual affection, and mutual affection with love.', '2 Peter 1:5-7'),
-        ('For he received honor and glory from God the Father when that\nvoice was conveyed to him by the Majestic Glory, saying, \n“This is my Son, my Beloved, with whom I am well pleased.”', '2 Peter 1:17'),
-        ('How lovely is your dwelling place, O Lord of hosts!\nMy soul longs, indeed it faints for the courts of the Lord; \nmy heart and my flesh sing for joy to the living God', 'Psalms 84:1-2'),
-        ('Will you not revive us again, so that your people may rejoice in you? \nShow us your steadfast love, O Lord, and grant us your salvation.', 'Psalms 85:6-7'),
-        ('Let me hear what God the Lord will speak, for he will speak peace to his people, \nto his faithful, to those who turn to him in their hearts.', 'Psalms 85:8'),
-        ('But God, who is rich in mercy, out of the great love with which he loved us \neven when we were dead through our trespasses, made us alive together with Christ— \nby grace you have been saved— and raised us up with him and seated us with him\nin the heavenly places in Christ Jesus', 'Ephesians 2:4-6'),
+        ('For this very reason, you must make every effort to support your faith\nwith goodness, and goodness with knowledge, and knowledge with self-control,\nand self-control with endurance, and endurance with godliness,\nand godliness with mutual affection, and mutual affection with love.', '2 Peter 1:5-7'),
+        ('For he received honor and glory from God the Father when that\nvoice was conveyed to him by the Majestic Glory, saying, \n"This is my Son, my Beloved, with whom I am well pleased."', '2 Peter 1:17'),
+        ('But God, who is rich in mercy, out of the great love with which he loved us \neven when we were dead through our trespasses, made us alive together with Christ— \nby grace you have been saved— and raised us up with him and seated us with him\nin the heavenly places in Christ Jesus', 'Ephesians 2:4-6'),
         ('For it is by grace you have been saved, through faith—and this is not from yourselves,\nit is the gift of God not by works, so that no one can boast.', 'Ephesians 2:8-9'),
         ('For we are what he has made us, created in Christ Jesus for good works, \nwhich God prepared beforehand to be our way of life.', 'Ephesians 2:10'),
-        ('Such is the confidence that we have through Christ toward God. \nNot that we are competent of ourselves to claim anything as coming from us;\nour competence is from God.', '2 Corinthians 3:4-5'),
+        ('Such is the confidence that we have through Christ toward God. \nNot that we are competent of ourselves to claim anything as coming from us;\nour competence is from God.', '2 Corinthians 3:4-5'),
         ('Now the Lord is the Spirit, and where the Spirit of the Lord is, there is freedom.', '2 Corinthians 3:17'),
         ('And all of us, with unveiled faces, seeing the glory of the Lord as though reflected in a mirror, \nare being transformed into the same image from one degree of glory to another;\nfor this comes from the Lord, the Spirit.', '2 Corinthians 3:18'),
         ('For the Lord does not see as mortals see; they look on the outward appearance,\nbut the Lord looks on the heart.', '1 Samuel 16:7'),
         ('By his great mercy he has given us a new birth into a living hope through the\nresurrection of Jesus Christ from the dead.', '1 Peter 1:3'),
-        ('and into an inheritance that is imperishable, undefiled, and unfading,\nkept in heaven for you, who are being protected by the power of God through\nfaith for a salvation ready to be revealed in the last time.', '1 Peter 1:4-5'),
+        ('and into an inheritance that is imperishable, undefiled, and unfading,\nkept in heaven for you, who are being protected by the power of God through\nfaith for a salvation ready to be revealed in the last time.', '1 Peter 1:4-5'),
         ('You who fear the Lord, trust in him, and your reward will not be lost.', 'Sirach 2:8'),
         ('You who fear the Lord, hope for good things, for lasting joy and mercy.', 'Sirach 2:9'),
         ('Consider the generations of old and see: has anyone trusted in the Lord and been disappointed? \nOr has anyone persevered in the fear of the Lord and been forsaken? \nOr has anyone called upon him and been neglected? \nFor the Lord is compassionate and merciful; he forgives sins and saves in time of distress.', 'Sirach 2:10-11'),
-        ('Those who fear the Lord prepare their hearts, \nand humble themselves before him.', 'Sirach 2:17'),
-        ('For the Lord God is a sun and shield; he bestows favor and honor. \nNo good thing does the Lord withhold from those who walk uprightly.', 'Psalms 84:11'),
+        ('Those who fear the Lord prepare their hearts, \nand humble themselves before him.', 'Sirach 2:17'),
     ],
 }
 
@@ -867,54 +1014,97 @@ def pick_truth() -> str:
     return f"*{ref}*\n\n{text}"
 
 
-# ── chat type detection ────────────────────────────────────────────────────
-def is_group(update: Update) -> bool:
-    return update.effective_chat and update.effective_chat.type in ("group", "supergroup")
+# ── deliver ──────────────────────────────────────────────────────────────────
+def fetch_readings_cached() -> dict | None:
+    """Fetch and cache today's readings."""
+    return fetch_readings_cached_for_date(today_sgt())
 
 
-# ── daily push ──────────────────────────────────────────────────────────────
-async def deliver_daily(app, chat_id: int, prefs: dict, data: dict | None = None):
-    users = load_users()
+FILE_LOCK = __import__("threading").Lock()
+
+
+def load_subs_safe() -> dict:
+    with FILE_LOCK:
+        return load_subs()
+
+
+def save_subs_safe(subs: dict):
+    with FILE_LOCK:
+        save_subs(subs)
+
+
+def load_users_safe() -> dict:
+    with FILE_LOCK:
+        return load_users()
+
+
+def save_users_safe(users: dict):
+    with FILE_LOCK:
+        save_users(users)
+
+
+async def deliver_daily(app, chat_id: int, prefs: dict):
+    users = load_users_safe()
     name = users.get(str(chat_id), "friend")
     greeting = random.choice(GREETINGS).format(name=name)
 
-    if data is None:
-        data = await asyncio.to_thread(fetch_readings)
-
+    data = await asyncio.to_thread(fetch_readings_cached)
     if data:
         texts = format_readings(data, mode=prefs.get("readings", "full"))
         for i, t in enumerate(texts):
             text = f"*{greeting}*\n\n{t}" if i == 0 else t
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            except Exception as e:
+                log.warning(f"Failed to send to {chat_id}: {e}")
+                # Clean up dead subscribers
+                err_str = str(e)
+                if "Forbidden" in err_str or "chat not found" in err_str.lower():
+                    subs = load_subs_safe()
+                    if str(chat_id) in subs:
+                        del subs[str(chat_id)]
+                        save_subs_safe(subs)
+                        log.info(f"Removed dead subscriber {chat_id}")
+                return
     else:
-        await app.bot.send_message(chat_id=chat_id, text="Couldn't fetch today's readings. 🙏")
+        try:
+            await app.bot.send_message(chat_id=chat_id, text="Couldn't fetch today's readings. 🙏")
+        except Exception:
+            pass
+        return
 
     if prefs.get("truth", True):
         verse = pick_truth()
-        await app.bot.send_message(chat_id=chat_id, text=f"*Truth for the day:*\n\n{verse}", parse_mode="Markdown")
-
-
-_BATCH_SIZE = 30
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=f"*Truth for the day:*\n\n{verse}", parse_mode="Markdown")
+        except Exception as e:
+            log.warning(f"Failed to send truth to {chat_id}: {e}")
 
 
 async def daily_push(context: ContextTypes.DEFAULT_TYPE):
-    subs = load_subs()
+    subs = load_subs_safe()
     from datetime import datetime
     current_time = datetime.now(SGT).strftime("%H:%M")
 
-    due = [(int(cid), prefs) for cid, prefs in subs.items()
-           if prefs.get("time", "06:00") == current_time]
-    if not due:
+    # Batch sends in groups of 30 to respect Telegram rate limits
+    batch = []
+    for chat_id_str, prefs in subs.items():
+        pref_time = prefs.get("time", "06:00")
+        if pref_time == current_time:
+            batch.append((int(chat_id_str), prefs))
+
+    if not batch:
         return
 
-    data = await asyncio.to_thread(fetch_readings)
-
-    for i in range(0, len(due), _BATCH_SIZE):
-        batch = due[i:i + _BATCH_SIZE]
-        await asyncio.gather(
-            *[deliver_daily(context.application, cid, prefs, data) for cid, prefs in batch],
-            return_exceptions=True,
-        )
+    log.info(f"Delivering daily push to {len(batch)} subscribers")
+    # Process in chunks of 30
+    chunk_size = 30
+    for i in range(0, len(batch), chunk_size):
+        chunk = batch[i:i + chunk_size]
+        await asyncio.gather(*[
+            deliver_daily(context.application, cid, prefs)
+            for cid, prefs in chunk
+        ], return_exceptions=True)
 
 
 # ── callback: subscribe menu ────────────────────────────────────────────────
@@ -923,7 +1113,7 @@ async def sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     chat_id = query.message.chat_id
-    subs = load_subs()
+    subs = load_subs_safe()
     key = str(chat_id)
 
     if data == "sub_readings_full":
@@ -940,12 +1130,24 @@ async def sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subs.setdefault(key, default_prefs())["time"] = "07:00"
     elif data == "sub_time_8":
         subs.setdefault(key, default_prefs())["time"] = "08:00"
+    elif data == "sub_time_12":
+        subs.setdefault(key, default_prefs())["time"] = "12:00"
+    elif data == "sub_time_17":
+        subs.setdefault(key, default_prefs())["time"] = "17:00"
+    elif data == "sub_time_custom":
+        context.user_data["awaiting_custom_time"] = True
+        prefs = subs.get(key, default_prefs())
+        await query.edit_message_text(
+            f"Your current time is {prefs['time']}. Send me your preferred time in 24-hour format (e.g., `14:30`):",
+            parse_mode="Markdown",
+        )
+        return
     elif data == "sub_cancel":
         await query.edit_message_text("Subscription cancelled. No changes made.", reply_markup=None)
         return
     elif data == "sub_confirm":
         prefs = subs.setdefault(key, default_prefs())
-        save_subs(subs)
+        save_subs_safe(subs)
         summary = (
             f"✅ *Subscribed!*\n\n"
             f"Readings: {'Full' if prefs['readings'] == 'full' else 'Gospel only'}\n"
@@ -956,8 +1158,19 @@ async def sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(summary, parse_mode="Markdown", reply_markup=None)
         return
 
-    save_subs(subs)
+    save_subs_safe(subs)
     prefs = subs.get(key, default_prefs())
+
+    def time_btn(label, time_val, prefs):
+        return InlineKeyboardButton(f"{'🕐' if prefs['time'] == time_val else '  '} {label}", callback_data=f"sub_time_{SUFFIX_MAP[time_val]}")
+
+    def custom_time_btn(prefs):
+        t = prefs['time']
+        is_custom = t not in ("06:00", "07:00", "08:00", "12:00", "17:00")
+        display = t if is_custom else "Custom"
+        return InlineKeyboardButton(f"{'🕐' if is_custom else '  '} {display}", callback_data="sub_time_custom")
+
+    # sub_callback remains below; duplicate in subscribe is patched separately
 
     def btn(label, active, cbd):
         return InlineKeyboardButton(f"{'✓' if active else '○'} {label}", callback_data=cbd)
@@ -968,9 +1181,14 @@ async def sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [btn("Include Truth", prefs['truth'], "sub_truth_on"),
          btn("No Truth", not prefs['truth'], "sub_truth_off")],
         [
-            InlineKeyboardButton(f"{'🕐' if prefs['time'] == '06:00' else '  '} 6am", callback_data="sub_time_6"),
-            InlineKeyboardButton(f"{'🕐' if prefs['time'] == '07:00' else '  '} 7am", callback_data="sub_time_7"),
-            InlineKeyboardButton(f"{'🕐' if prefs['time'] == '08:00' else '  '} 8am", callback_data="sub_time_8"),
+            time_btn("6am", "06:00", prefs),
+            time_btn("7am", "07:00", prefs),
+            time_btn("8am", "08:00", prefs),
+        ],
+        [
+            time_btn("12pm", "12:00", prefs),
+            time_btn("5pm", "17:00", prefs),
+            custom_time_btn(prefs),
         ],
         [InlineKeyboardButton("✅ Confirm", callback_data="sub_confirm"),
          InlineKeyboardButton("❌ Cancel", callback_data="sub_cancel")],
@@ -988,6 +1206,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🙏 *Catholic Daily Bot*\n\n"
             "Daily mass readings and Bible verses, right here.\n\n"
             "📖 `/today` — today's mass readings\n"
+            "📖 `/readings` — tomorrow/Sunday/date readings\n"
             "🙏 `/truth` — random Bible verse\n"
             "⚙️ `/subscribe` — set up daily push for this group\n"
             "ℹ️ `/help` — all commands",
@@ -995,15 +1214,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    users = load_users()
+    users = load_users_safe()
     key = str(update.message.chat_id)
-    if key not in users:
-        context.user_data["awaiting_name"] = True
+    if key in users:
+        name = users[key]
+        greeting = random.choice(GREETINGS).format(name=name)
         await update.message.reply_text(
-            "🙏 *Catholic Daily Bot*\n\n"
-            "Welcome! Before we begin — what's your name?",
+            f"Welcome back, {name}! 🙏\n\n"
+            "📖 `/today` — today's mass readings\n"
+            "📖 `/readings` — tomorrow/Sunday/date readings\n"
+            "🙏 `/truth` — random Bible verse\n"
+            "📜 `/office` — Divine Office prayers\n"
+            "⚙️ `/subscribe` — daily push at your preferred time\n"
+            "ℹ️ `/help` — all commands",
             parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
@@ -1015,26 +1240,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ `/subscribe` — daily push at your preferred time\n"
         "⛪ *Nearest Mass* — the next Mass you can get to\n"
         "ℹ️ `/help` — all commands\n\n"
-        "Use the buttons below to get started!",
+        "What's your name?",
         parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
     )
+    context.user_data["awaiting_name"] = True
+
+
+def is_group(update: Update) -> bool:
+    return update.message.chat.type in {"group", "supergroup"}
 
 
 async def help_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Commands*\n\n"
-        "`/today` — Today's mass readings\n"
+        "📖 `/today` — Today's mass readings\n"
+        "`/readings` — Choose tomorrow or Sunday readings\n"
+        "`/readings DDMMYY` — Mass readings for a date, e.g. `/readings 090626`\n"
         "`/truth` — Random Bible verse from a curated list\n"
-        "`/subscribe` — Set up daily push at 6/7/8am SGT\n"
+        "`/office` — Choose a Divine Office hour\n"
+        "`/office_readings` — Office of Readings\n"
+        "`/lauds` — Morning Prayer\n"
+        "`/terce` — Mid-morning Prayer\n"
+        "`/sext` — Midday Prayer\n"
+        "`/none` — Mid-afternoon Prayer\n"
+        "`/vespers` — Evening Prayer\n"
+        "`/compline` — Night Prayer\n"
+        "`/subscribe` — Set up daily push (6am, 7am, 8am, 12pm, 5pm, or custom time)\n"
         "   • Pick full readings or gospel-only\n"
         "   • Toggle daily truth on/off\n"
         "`/unsubscribe` — Stop daily messages\n"
         "`/mass` — Nearest Mass you can get to by bus & MRT\n"
+        "`/feedback <msg>` — Send anonymous feedback\n"
         "`/help` — This message\n\n"
         "*Data source:*\n"
-        "📖 Mass readings: Jerusalem Bible via Universalis API (Singapore calendar)\n"
-        "🙏 Random verses: curated from NIV/NLT\n\n"
+        "📖 Mass readings: Jerusalem Bible via Universalis (Singapore calendar)\n"
+        "📜 Divine Office: parsed from the Universalis website (Singapore calendar); translation/wording may differ from your local breviary or app.\n"
+        "🙏 Truth verses: OYP / NUS CSS\n\n"
+        "*Copyright:*\n"
+        "© 1996-2026 Universalis Publishing Ltd — universalis.com\n"
+        "Jerusalem Bible © 1966, 1967, 1968 Hodder & Stoughton / Doubleday\n"
+        "Psalms © 1963 The Grail (England)\n"
+        "Psalm Responses & Roman Missal © ICEL\n\n"
         "🤖 *About*\n"
         "Created by @anselmlong — DM for feedback or suggestions!",
         parse_mode="Markdown",
@@ -1044,9 +1290,20 @@ async def help_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
 
 async def subscribe(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    subs = load_subs()
+    subs = load_subs_safe()
     key = str(chat_id)
     prefs = subs.get(key, default_prefs())
+
+    def time_btn(label, time_val, prefs):
+        return InlineKeyboardButton(f"{'🕐' if prefs['time'] == time_val else '  '} {label}", callback_data=f"sub_time_{SUFFIX_MAP[time_val]}")
+
+    def custom_time_btn(prefs):
+        t = prefs['time']
+        is_custom = t not in ("06:00", "07:00", "08:00", "12:00", "17:00")
+        display = t if is_custom else "Custom"
+        return InlineKeyboardButton(f"{'🕐' if is_custom else '  '} {display}", callback_data="sub_time_custom")
+
+    # sub_callback remains below; duplicate in subscribe is patched separately
 
     def btn(label, active, cbd):
         return InlineKeyboardButton(f"{'✓' if active else '○'} {label}", callback_data=cbd)
@@ -1057,9 +1314,14 @@ async def subscribe(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         [btn("Include Truth", prefs['truth'], "sub_truth_on"),
          btn("No Truth", not prefs['truth'], "sub_truth_off")],
         [
-            InlineKeyboardButton(f"{'🕐' if prefs['time'] == '06:00' else '  '} 6am", callback_data="sub_time_6"),
-            InlineKeyboardButton(f"{'🕐' if prefs['time'] == '07:00' else '  '} 7am", callback_data="sub_time_7"),
-            InlineKeyboardButton(f"{'🕐' if prefs['time'] == '08:00' else '  '} 8am", callback_data="sub_time_8"),
+            time_btn("6am", "06:00", prefs),
+            time_btn("7am", "07:00", prefs),
+            time_btn("8am", "08:00", prefs),
+        ],
+        [
+            time_btn("12pm", "12:00", prefs),
+            time_btn("5pm", "17:00", prefs),
+            custom_time_btn(prefs),
         ],
         [InlineKeyboardButton("✅ Confirm", callback_data="sub_confirm"),
          InlineKeyboardButton("❌ Cancel", callback_data="sub_cancel")],
@@ -1071,26 +1333,30 @@ async def subscribe(update: Update, _context: ContextTypes.DEFAULT_TYPE):
 
 
 async def unsubscribe(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    subs = load_subs()
-    key = str(update.message.chat_id)
+    chat_id = update.message.chat_id
+    key = str(chat_id)
+    subs = load_subs_safe()
     if key in subs:
         del subs[key]
-        save_subs(subs)
-        await update.message.reply_text("Unsubscribed. No more daily messages.", reply_markup=MAIN_KEYBOARD)
+        save_subs_safe(subs)
+        await update.message.reply_text(
+            "You've been unsubscribed from daily messages.\n"
+            "Use `/subscribe` to re-subscribe anytime.",
+            parse_mode="Markdown",
+        )
     else:
-        await update.message.reply_text("You're not subscribed.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("You're not currently subscribed.")
 
 
 async def today(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("📖 fetching...")
-    data = await asyncio.to_thread(fetch_readings)
-    if not data:
-        await msg.edit_text("Couldn't reach the readings source right now. Try again in a bit. 🙏")
-        return
-    texts = format_readings(data)
-    await msg.edit_text(texts[0], parse_mode="Markdown")
-    for t in texts[1:]:
-        await update.message.reply_text(t, parse_mode="Markdown")
+    await update.message.reply_text("Fetching today's readings... 🙏")
+    data = await asyncio.to_thread(fetch_readings_cached)
+    if data:
+        texts = format_readings(data)
+        for t in texts:
+            await update.message.reply_text(t, parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Couldn't fetch today's readings. 🙏")
 
 
 async def truth(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -1098,8 +1364,151 @@ async def truth(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(verse, parse_mode="Markdown")
 
 
+def readings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Tomorrow", callback_data="mass_tomorrow"),
+            InlineKeyboardButton("Sunday", callback_data="mass_sunday"),
+        ],
+    ])
+
+
+async def readings_menu(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Readings*\n\nChoose readings to view, or use `/readings DDMMYY`.",
+        parse_mode="Markdown",
+        reply_markup=readings_keyboard(),
+    )
+
+
+def parse_ddmmyy(raw: str) -> date | None:
+    try:
+        return datetime.strptime(raw.strip(), "%d%m%y").date()
+    except ValueError:
+        return None
+
+
+def upcoming_sunday(from_date: date | None = None) -> date:
+    if from_date is None:
+        from_date = today_sgt()
+    days = (6 - from_date.weekday()) % 7
+    if days == 0:
+        days = 7
+    return from_date + timedelta(days=days)
+
+
+async def send_mass_readings(message, d: date):
+    await message.reply_text(f"Fetching readings for {d.strftime('%d %b %Y')}... 🙏")
+    data = await asyncio.to_thread(fetch_readings_cached_for_date, d)
+    if not data:
+        await message.reply_text("Couldn't fetch readings for that date. Universalis usually has yesterday through the week ahead. 🙏")
+        return
+    texts = format_readings(data)
+    header = f"📖 *Mass readings — {d.strftime('%d %b %Y')}*\n\n"
+    for i, t in enumerate(texts):
+        await message.reply_text((header if i == 0 else "") + t, parse_mode="Markdown")
+
+
+async def readings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        d = parse_ddmmyy(context.args[0])
+        if not d:
+            await update.message.reply_text("Use `/readings DDMMYY`, e.g. `/readings 090626`.", parse_mode="Markdown")
+            return
+        await send_mass_readings(update.message, d)
+        return
+    await readings_menu(update, context)
+
+
+async def readings_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+    if data == "mass_tomorrow":
+        d = today_sgt() + timedelta(days=1)
+    elif data == "mass_sunday":
+        d = upcoming_sunday()
+    else:
+        await query.answer("Unknown readings option")
+        return
+    await query.answer(f"Fetching {d.strftime('%d %b')} readings...")
+    await send_mass_readings(query.message, d)
+
+
+def office_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Office of Readings", callback_data="office_readings"),
+            InlineKeyboardButton("Lauds", callback_data="office_lauds"),
+        ],
+        [
+            InlineKeyboardButton("Terce", callback_data="office_terce"),
+            InlineKeyboardButton("Sext", callback_data="office_sext"),
+            InlineKeyboardButton("None", callback_data="office_none"),
+        ],
+        [
+            InlineKeyboardButton("Vespers", callback_data="office_vespers"),
+            InlineKeyboardButton("Compline", callback_data="office_compline"),
+        ],
+    ])
+
+
+async def office_menu(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📜 *Divine Office*\n\nChoose an hour for today:",
+        parse_mode="Markdown",
+        reply_markup=office_keyboard(),
+    )
+
+
+async def send_office_message(message, office_key: str):
+    label = OFFICE_LABELS.get(office_key, office_key.title())
+    await message.reply_text(f"Fetching {label}... 🙏")
+    data = await asyncio.to_thread(fetch_divine_office_cached)
+    office = (data or {}).get("offices", {}).get(office_key)
+    if not office:
+        await message.reply_text(f"Couldn't fetch {label} today. 🙏")
+        return
+    for chunk in format_office_messages(office):
+        await message.reply_text(chunk, parse_mode="HTML")
+
+
+async def office_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    command = update.message.text.split()[0].lstrip("/").split("@", 1)[0]
+    office_key = {
+        "office_readings": "readings",
+        "readings": "readings",
+        "lauds": "lauds",
+        "terce": "terce",
+        "sext": "sext",
+        "none": "none",
+        "vespers": "vespers",
+        "compline": "compline",
+    }.get(command)
+    if not office_key:
+        await office_menu(update, context)
+        return
+    await send_office_message(update.message, office_key)
+
+
+async def office_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+    office_key = data.removeprefix("office_")
+    if office_key not in OFFICES:
+        await query.answer("Unknown office")
+        return
+    await query.answer(f"Fetching {OFFICE_LABELS[office_key]}...")
+    await send_office_message(query.message, office_key)
+
+
+async def refresh_divine_office_job(_context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.to_thread(fetch_divine_office_cached)
+
+
 # ── admin ─────────────────────────────────────────────────────────────────────
 ALLOWED_USERS = {"495290408"}
+# Maps time values (HH:MM) to callback data suffixes for subscribe time buttons
+SUFFIX_MAP = {"06:00": "6", "07:00": "7", "08:00": "8", "12:00": "12", "17:00": "17"}
 
 
 async def users_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -1107,14 +1516,124 @@ async def users_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     if user_id not in ALLOWED_USERS:
         await update.message.reply_text("You don't have permission to use this command.")
         return
-    users = load_users()
-    subs = load_subs()
+    users = load_users_safe()
+    subs = load_subs_safe()
     msg = (
-        f"👥 *Users: {len(users)}*\n\n"
-        + "\n".join(f"• {name}" for name in sorted(users.values()))
-        + f"\n\n📬 *Subscribed: {len(subs)}*"
+        f"👥 Users: {len(users)}\n\n"
+        + "\n".join(f"• {name}" for name in users.values())
+        + f"\n\n📬 Subscribed: {len(subs)}"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg)
+
+
+async def announce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_id not in ALLOWED_USERS:
+        await update.message.reply_text("You don't have permission to use this command.")
+        return
+
+    test_only = bool(context.args and context.args[0] in ("-t", "--test"))
+    context.user_data["awaiting_announce"] = {"test_only": test_only}
+
+    if test_only:
+        await update.message.reply_text(
+            "✏️ Send me the announcement text (test mode — only you'll see it).\n"
+            "Use `<b>bold</b>`, `<i>italic</i>` for formatting.\n\n"
+            "Send /cancel to abort.",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            "✏️ Send me the announcement text to broadcast to all users.\n"
+            "Use `<b>bold</b>`, `<i>italic</i>` for formatting.\n\n"
+            "Send /cancel to abort.",
+            parse_mode="HTML",
+        )
+
+
+async def send_announcement(app, message: str, test_only: bool, reply_to):
+    """Send announcement to the target set, report back to reply_to chat."""
+    users = load_users_safe()
+    subs = load_subs_safe()
+
+    if test_only:
+        chat_ids = {str(int(admin_id)) for admin_id in ALLOWED_USERS}
+    else:
+        chat_ids = set(users.keys())
+        chat_ids.update(subs.keys())
+
+    if not chat_ids:
+        await app.bot.send_message(chat_id=reply_to, text="No users to announce to.")
+        return
+
+    # Build the message — escape only angle brackets that aren't part of safe HTML tags
+    # Allow: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="">
+    safe_tags = {"b", "i", "u", "s", "code", "pre", "a"}
+    import re
+    def keep_safe_tags(m):
+        tag = m.group(1)
+        tag_name = tag.split()[0].lower().rstrip(">").lstrip("/")
+        return m.group(0) if tag_name in safe_tags else html_lib.escape(m.group(0))
+    message = re.sub(r"<(/?(?:\w+)(?:\s+[^>]*)?)>", keep_safe_tags, message)
+
+    full = f"📢 <b>Announcement</b> 📢\n\n{message}"
+
+    sent = 0
+    failed = 0
+    for cid in chat_ids:
+        try:
+            await app.bot.send_message(chat_id=int(cid), text=full, parse_mode="HTML")
+            sent += 1
+        except Exception as e:
+            failed += 1
+            log.warning(f"Announcement failed for {cid}: {e}")
+
+    await app.bot.send_message(
+        chat_id=reply_to,
+        text=f"Done. Sent to {sent}/{len(chat_ids)}. {failed} failed.",
+    )
+
+
+async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Send feedback with `/feedback <your message>`\n\n"
+            "Include your Telegram handle (e.g. @username) if you'd like a reply. "
+            "Your feedback is anonymous otherwise.",
+            parse_mode="Markdown",
+        )
+        return
+    message = " ".join(context.args)
+    users = load_users_safe()
+    chat_id = str(update.message.chat_id)
+    sender = users.get(chat_id, f"Anonymous ({chat_id})")
+
+    # Forward to admin
+    for admin_id in ALLOWED_USERS:
+        try:
+            await context.application.bot.send_message(
+                chat_id=int(admin_id),
+                text=f"💬 <b>Feedback from {html_lib.escape(sender)}</b>\n\n{html_lib.escape(message)}",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            log.warning(f"Failed to forward feedback: {e}")
+
+    await update.message.reply_text(
+        "Thanks for your feedback! 🙏 I read every message.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cleared = []
+    for key in ("awaiting_name", "awaiting_custom_time", "awaiting_announce"):
+        if context.user_data.pop(key, None):
+            cleared.append(key)
+    if cleared:
+        await update.message.reply_text("Cancelled.", reply_markup=MAIN_KEYBOARD)
+    else:
+        await update.message.reply_text("Nothing to cancel.")
 
 
 # ── nearest Mass (via MassGoWhere) ──────────────────────────────────────────
@@ -1243,17 +1762,19 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not name or len(name) > 50:
             await update.message.reply_text("Please send me your name (max 50 chars):")
             return
-        users = load_users()
+        users = load_users_safe()
         key = str(update.message.chat_id)
         users[key] = name
-        save_users(users)
+        save_users_safe(users)
         context.user_data["awaiting_name"] = False
         await update.message.reply_text(
             f"Thanks, {name}! 🙏\n\n"
             "🙏 *Catholic Daily Bot*\n\n"
             "Daily mass readings and Bible verses, right here.\n\n"
             "📖 `/today` — today's mass readings\n"
+            "📖 `/readings` — tomorrow/Sunday/date readings\n"
             "🙏 `/truth` — random Bible verse\n"
+            "📜 `/office` — Divine Office prayers\n"
             "⚙️ `/subscribe` — daily push at your preferred time\n"
             "⛪ *Nearest Mass* — the next Mass you can get to\n"
             "ℹ️ `/help` — all commands\n\n"
@@ -1263,10 +1784,41 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # custom time capture mode
+    if context.user_data.get("awaiting_custom_time"):
+        raw = text.strip()
+        match = re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", raw)
+        if not match:
+            await update.message.reply_text(
+                "Invalid time format. Please use 24-hour format (HH:MM), e.g. `14:30`.",
+                parse_mode="Markdown",
+            )
+            return
+        subs = load_subs_safe()
+        key = str(update.message.chat_id)
+        subs.setdefault(key, default_prefs())["time"] = raw
+        save_subs_safe(subs)
+        context.user_data["awaiting_custom_time"] = False
+        await update.message.reply_text(f"✅ Time set to {raw}. You can review and confirm below:")
+        await subscribe(update, context)
+        return
+
+    # announcement text capture mode
+    if context.user_data.get("awaiting_announce"):
+        announce_data = context.user_data["awaiting_announce"]
+        test_only = announce_data.get("test_only", False)
+        context.user_data["awaiting_announce"] = False
+        await send_announcement(context.application, text, test_only, update.message.chat_id)
+        return
+
     if text == "📖 Today":
         await today(update, context)
     elif text == "🙏 Truth":
         await truth(update, context)
+    elif text == "📖 Readings":
+        await readings_menu(update, context)
+    elif text == "📜 Divine Office":
+        await office_menu(update, context)
     elif text == "⚙️ Subscribe":
         await subscribe(update, context)
     elif text == "ℹ️ Help":
@@ -1283,16 +1835,31 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("truth", truth))
+    app.add_handler(CommandHandler("readings", readings_command))
+    app.add_handler(CommandHandler("office", office_menu))
+    app.add_handler(CommandHandler("office_readings", office_command))
+    app.add_handler(CommandHandler("lauds", office_command))
+    app.add_handler(CommandHandler("terce", office_command))
+    app.add_handler(CommandHandler("sext", office_command))
+    app.add_handler(CommandHandler("none", office_command))
+    app.add_handler(CommandHandler("vespers", office_command))
+    app.add_handler(CommandHandler("compline", office_command))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("mass", mass_cmd))
     app.add_handler(MessageHandler(filters.LOCATION, nearest_mass))
+    app.add_handler(CommandHandler("announce", announce_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("feedback", feedback_cmd))
     app.add_handler(CallbackQueryHandler(sub_callback, pattern="^sub_"))
+    app.add_handler(CallbackQueryHandler(readings_callback, pattern="^mass_"))
+    app.add_handler(CallbackQueryHandler(office_callback, pattern="^office_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
 
     jq = app.job_queue
     jq.run_repeating(daily_push, interval=60, first=10, name="daily_check")
+    jq.run_daily(refresh_divine_office_job, time=datetime.strptime("00:10", "%H:%M").time().replace(tzinfo=SGT), name="divine_office_refresh")
 
     log.info("starting polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
