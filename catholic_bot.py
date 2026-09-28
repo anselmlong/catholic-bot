@@ -32,7 +32,7 @@ if not TOKEN:
 SUBS_FILE = os.path.join(os.path.dirname(__file__), "subscriptions.json")
 USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
 # nearest Mass comes from MassGoWhere, so both bots and the website give the same answer
-MASS_API = os.getenv("MASSGOWHERE_API", "https://mass.anselmlong.com").rstrip("/")
+MASS_API = os.getenv("MASSGOWHERE_API", "https://massgowhere.com").rstrip("/")
 MASS_BOT = "massgowherebot"
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 DIVINE_OFFICE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "divine_office_cache.json")
