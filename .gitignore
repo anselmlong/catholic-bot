@@ -26,3 +26,7 @@ dist/
 users.json
 obolus_cookie.json
 .gstack/
+
+# nearest-mass usage counts
+mass_stats.json
+mass_stats.json.tmp

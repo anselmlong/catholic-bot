@@ -2,12 +2,14 @@
 """catholic-bot — daily mass readings + random bible verse + subscribe."""
 
 import html as html_lib
+import hashlib
 import json
 import logging
 import os
 import random
 import re
 import sys
+import threading
 import time
 import asyncio
 from datetime import date, datetime, timedelta
@@ -35,6 +37,9 @@ USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
 MASS_API = os.getenv("MASSGOWHERE_API", "https://massgowhere.com").rstrip("/")
 MASS_BOT = "massgowherebot"
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+# Nearest Mass usage per SGT day: count, and who asked as salted hashes of the chat id (no names, no locations)
+MASS_STATS_FILE = os.path.join(os.path.dirname(__file__), "mass_stats.json")
+_mass_stats_lock = threading.Lock()
 DIVINE_OFFICE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "divine_office_cache.json")
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1522,8 +1527,19 @@ async def users_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         f"👥 Users: {len(users)}\n\n"
         + "\n".join(f"• {name}" for name in users.values())
         + f"\n\n📬 Subscribed: {len(subs)}"
+        + "\n\n" + "\n".join(_mass_stats_lines())
     )
     await update.message.reply_text(msg)
+
+
+async def stats_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Counts only (no names): users, subscribers, Nearest Mass usage."""
+    if str(update.message.chat_id) not in ALLOWED_USERS:
+        await update.message.reply_text("You don't have permission to use this command.")
+        return
+    users, subs = load_users_safe(), load_subs_safe()
+    await update.message.reply_text(
+        f"👥 Users: {len(users)}\n📬 Subscribed: {len(subs)}\n\n" + "\n".join(_mass_stats_lines()))
 
 
 async def announce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1670,6 +1686,53 @@ def _more_options_line() -> str:
             f"or <a href=\"{MASS_API}\">{escape(MASS_API.split('//')[-1])}</a>.")
 
 
+def _load_mass_stats() -> dict:
+    try:
+        with open(MASS_STATS_FILE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    st.setdefault("salt", os.urandom(8).hex())
+    st.setdefault("days", {})
+    return st
+
+
+def _record_mass(chat_id: int):
+    """Count one Nearest Mass request; a stats problem never gets in the way of the answer."""
+    try:
+        with _mass_stats_lock:
+            st = _load_mass_stats()
+            who = hashlib.sha256(f"{st['salt']}:{chat_id}".encode()).hexdigest()[:12]
+            d = st["days"].setdefault(datetime.now(SGT).strftime("%Y-%m-%d"), {"uses": 0, "people": []})
+            d["uses"] += 1
+            if who not in d["people"]:
+                d["people"].append(who)
+            tmp = MASS_STATS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.replace(tmp, MASS_STATS_FILE)
+    except Exception as e:  # noqa: BLE001
+        log.warning("mass stats not recorded: %s", e)
+
+
+def _mass_stats_lines() -> list:
+    days = _load_mass_stats()["days"]
+    today = datetime.now(SGT).date()
+
+    def span(n):
+        keys = {(today - timedelta(days=i)).isoformat() for i in range(n)}
+        ds = [d for k, d in days.items() if k in keys]
+        return sum(d["uses"] for d in ds), len(set().union(*[set(d["people"]) for d in ds])) if ds else 0
+
+    lines = ["⛪ Nearest Mass"]
+    for label, n in (("Today", 1), ("Last 7 days", 7), ("Last 30 days", 30)):
+        uses, people = span(n)
+        lines.append(f"{label}: {uses} uses · {people} {'person' if people == 1 else 'people'}")
+    everyone = set().union(*[set(d["people"]) for d in days.values()]) if days else set()
+    lines.append(f"All time: {sum(d['uses'] for d in days.values())} uses · {len(everyone)} people")
+    return lines
+
+
 async def mass_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """/mass: location can only come from the keyboard button, so point people to it."""
     if is_group(update):
@@ -1721,6 +1784,7 @@ async def nearest_mass(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """Answers straight away: a placeholder, then the quick estimate, then live travel times, each edited in place."""
     loc = update.message.location
     note = await update.message.reply_text("⛪ Finding the nearest Mass…")
+    _record_mass(update.message.chat_id)
 
     async def show(text, kb=None, html=True):
         try:
@@ -1848,6 +1912,7 @@ def main():
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("mass", mass_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.LOCATION, nearest_mass))
     app.add_handler(CommandHandler("announce", announce_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
