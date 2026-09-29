@@ -1793,20 +1793,31 @@ async def nearest_mass(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:  # noqa: BLE001 - e.g. the live answer matches the estimate exactly ("not modified")
             log.info("mass edit skipped: %s", e)
 
+    # Start the live request and wait a few seconds for it, so most answers appear once and don't change under you;
+    # only when live is slow does the estimate show first (then it's replaced in place).
+    outside = "That location isn't in Singapore. Nearest Mass only covers Singapore's parishes."
+    live_task = asyncio.create_task(asyncio.to_thread(_fetch_next_mass, loc.latitude, loc.longitude))
+    try:
+        live = await asyncio.wait_for(asyncio.shield(live_task), timeout=3)
+        if live is None:
+            return await show(outside, html=False)
+        return await show(*_render_mass(live, loc, refining=False))
+    except asyncio.TimeoutError:
+        pass
+    except Exception as e:  # noqa: BLE001 - live failed quickly; try the estimate
+        log.warning("massgowhere api error: %s", e)
     estimate = None
     try:
         estimate = await asyncio.to_thread(_fetch_next_mass, loc.latitude, loc.longitude, True)
         if estimate is None:
-            await show("That location isn't in Singapore. Nearest Mass only covers Singapore's parishes.", html=False)
-            return
+            return await show(outside, html=False)
         await show(*_render_mass(estimate, loc, refining=bool(estimate.get("best"))))
     except Exception as e:  # noqa: BLE001
         log.warning("massgowhere fast api error: %s", e)
     try:
-        live = await asyncio.to_thread(_fetch_next_mass, loc.latitude, loc.longitude)
+        live = await live_task
         if live is None:
-            await show("That location isn't in Singapore. Nearest Mass only covers Singapore's parishes.", html=False)
-            return
+            return await show(outside, html=False)
         await show(*_render_mass(live, loc, refining=False))
     except Exception as e:  # noqa: BLE001 - never leave the user hanging
         log.warning("massgowhere api error: %s", e)
